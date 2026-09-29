@@ -10,6 +10,17 @@
   --font-sans: var(--font-sans);
   --font-mono: var(--font-geist-mono);
   --font-heading: var(--font-sans);
+  --font-display: var(--font-display);
+  --color-signal: var(--signal);
+  --color-board: var(--board);
+  --color-flap: var(--flap);
+  --color-flap-edge: var(--flap-edge);
+  --color-chalk: var(--chalk);
+  --color-chalk-dim: var(--chalk-dim);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --color-up-ink: var(--up-ink);
+  --color-down-ink: var(--down-ink);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -49,30 +60,31 @@
 }
 
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  /* Counter: a cool paper page with ink type. */
+  --background: #e9ecef;
+  --foreground: #10141a;
+  --card: #f6f7f8;
+  --card-foreground: #10141a;
+  --popover: #f6f7f8;
+  --popover-foreground: #10141a;
+  --primary: #10141a;
+  --primary-foreground: #f6f7f8;
+  --secondary: #dde1e5;
+  --secondary-foreground: #10141a;
+  --muted: #dde1e5;
+  --muted-foreground: #58626e;
+  --accent: #dde1e5;
+  --accent-foreground: #10141a;
+  --destructive: #b8321f;
+  --border: #cbd1d8;
+  --input: #b4bcc5;
+  --ring: #10141a;
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
-  --radius: 0.625rem;
+  --radius: 0.5rem;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
   --sidebar-primary: oklch(0.205 0 0);
@@ -81,6 +93,18 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+
+  /* Board: the split-flap display that carries the live prices. */
+  --signal: #ffd11a;
+  --board: #12151a;
+  --flap: #1d2128;
+  --flap-edge: #0a0c0f;
+  --chalk: #efebdd;
+  --chalk-dim: #8f9aa6;
+  --up: #35d69a;
+  --down: #ff7566;
+  --up-ink: #0a7a52;
+  --down-ink: #b8321f;
 }
 
 .dark {
@@ -126,5 +150,40 @@
   }
   html {
     @apply font-sans;
+  }
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+  :focus-visible {
+    outline: 2px solid var(--foreground);
+    outline-offset: 2px;
+  }
+}
+
+/* A character drops into place from the top edge, like a split-flap tile. */
+@keyframes flap-drop {
+  from {
+    transform: rotateX(-88deg);
+    opacity: 0.15;
+  }
+  to {
+    transform: rotateX(0deg);
+    opacity: 1;
+  }
+}
+
+.flap-char {
+  display: inline-block;
+  transform-origin: 50% 0%;
+  backface-visibility: hidden;
+  animation: flap-drop 280ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flap-char {
+    animation: none;
   }
 }

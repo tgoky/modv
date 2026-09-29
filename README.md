@@ -1,3 +1,26 @@
+# modv
+
+A test-experiment forex and crypto broker app: a landing page with live prices, account signup and login, and a dashboard.
+
+## Setup
+
+```bash
+pnpm install
+cp .env.example .env.local   # then fill in SESSION_SECRET (openssl rand -base64 32)
+pnpm dev
+```
+
+## Where the prices come from
+
+- **Crypto** streams into the browser from Coinbase's public WebSocket (no key). The dashboard chart loads 5-minute candles through `/api/history` and extends them live.
+- **Currencies** are polled from `/api/fx`, which caches the provider server-side. With `TWELVE_DATA_API_KEY` set it uses Twelve Data real-time quotes (free plan: 800 requests a day, so responses are cached for 90 seconds). Without a key, or if the provider errors, it falls back to the ECB's daily reference rates via Frankfurter, and the board labels them as daily rates.
+
+## Accounts
+
+Passwords are hashed with scrypt and sessions are HMAC-signed cookies; there are no extra dependencies. Users are stored in a local JSON file (`.data/users.json`) so the app runs with zero setup. That is for development only: replace the functions in `src/lib/auth/users.ts` with your database before deploying. Balances are virtual.
+
+---
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started

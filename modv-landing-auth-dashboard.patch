@@ -1,0 +1,2479 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..241440d
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,13 @@
++# Required in production. Generate one with: openssl rand -base64 32
++SESSION_SECRET=
++
++# Optional. Real-time currency quotes from Twelve Data (https://twelvedata.com).
++# Without it the board falls back to the ECB's daily reference rates and says so.
++# The free plan allows 800 requests a day, which is why /api/fx caches responses.
++TWELVE_DATA_API_KEY=
++
++# Optional. Seconds to cache live currency quotes (minimum 5, default 90).
++FX_CACHE_SECONDS=
++
++# Optional. Where the development user store is written (default: ./.data).
++USER_STORE_DIR=
+diff --git a/.gitignore b/.gitignore
+index 5ef6a52..5fa71cb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -32,6 +32,7 @@ yarn-error.log*
+ 
+ # env files (can opt-in for committing if needed)
+ .env*
++!.env.example
+ 
+ # vercel
+ .vercel
+@@ -39,3 +40,6 @@ yarn-error.log*
+ # typescript
+ *.tsbuildinfo
+ next-env.d.ts
++
++# local user store for development (see src/lib/auth/users.ts)
++/.data/
+diff --git a/README.md b/README.md
+index e215bc4..dba0f6a 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,26 @@
++# modv
++
++A test-experiment forex and crypto broker app: a landing page with live prices, account signup and login, and a dashboard.
++
++## Setup
++
++```bash
++pnpm install
++cp .env.example .env.local   # then fill in SESSION_SECRET (openssl rand -base64 32)
++pnpm dev
++```
++
++## Where the prices come from
++
++- **Crypto** streams into the browser from Coinbase's public WebSocket (no key). The dashboard chart loads 5-minute candles through `/api/history` and extends them live.
++- **Currencies** are polled from `/api/fx`, which caches the provider server-side. With `TWELVE_DATA_API_KEY` set it uses Twelve Data real-time quotes (free plan: 800 requests a day, so responses are cached for 90 seconds). Without a key, or if the provider errors, it falls back to the ECB's daily reference rates via Frankfurter, and the board labels them as daily rates.
++
++## Accounts
++
++Passwords are hashed with scrypt and sessions are HMAC-signed cookies; there are no extra dependencies. Users are stored in a local JSON file (`.data/users.json`) so the app runs with zero setup. That is for development only: replace the functions in `src/lib/auth/users.ts` with your database before deploying. Balances are virtual.
++
++---
++
+ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+ 
+ ## Getting Started
+diff --git a/src/app/actions/auth.ts b/src/app/actions/auth.ts
+new file mode 100644
+index 0000000..720f591
+--- /dev/null
++++ b/src/app/actions/auth.ts
+@@ -0,0 +1,93 @@
++"use server";
++
++import { headers } from "next/headers";
++import { redirect } from "next/navigation";
++import { hashPassword, verifyAgainstDecoy, verifyPassword } from "@/lib/auth/password";
++import { createSession, deleteSession } from "@/lib/auth/session";
++import { clearFailures, isThrottled, recordFailure } from "@/lib/auth/throttle";
++import { createUser, findUserByEmail } from "@/lib/auth/users";
++import type { AuthFormState } from "@/lib/auth/form-state";
++
++const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
++
++const text = (form: FormData, key: string) => String(form.get(key) ?? "");
++
++async function clientKey(email: string): Promise<string> {
++  const forwarded = (await headers()).get("x-forwarded-for")?.split(",")[0]?.trim();
++  return `${forwarded ?? "local"}:${email}`;
++}
++
++export async function signup(
++  _prev: AuthFormState | undefined,
++  formData: FormData,
++): Promise<AuthFormState> {
++  const name = text(formData, "name").trim();
++  const email = text(formData, "email").trim().toLowerCase();
++  const password = text(formData, "password");
++  const values = { name, email };
++
++  const errors: NonNullable<AuthFormState["errors"]> = {};
++  if (!name) errors.name = "Enter your name.";
++  else if (name.length > 60) errors.name = "Use 60 characters or fewer.";
++  if (!EMAIL.test(email) || email.length > 254) errors.email = "Enter a valid email address.";
++  if (password.length < 8) errors.password = "Use at least 8 characters.";
++  else if (password.length > 128) errors.password = "Use 128 characters or fewer.";
++  if (Object.keys(errors).length) return { errors, values };
++
++  let userId: string;
++  try {
++    const result = await createUser({ name, email, passwordHash: await hashPassword(password) });
++    if (!result.ok) {
++      return { errors: { email: "An account with this email already exists. Log in instead." }, values };
++    }
++    userId = result.user.id;
++  } catch (err) {
++    console.error("[signup] could not create user", err);
++    return { errors: { form: "We couldn't create your account. Try again in a moment." }, values };
++  }
++
++  await createSession(userId);
++  redirect("/dashboard");
++}
++
++export async function login(
++  _prev: AuthFormState | undefined,
++  formData: FormData,
++): Promise<AuthFormState> {
++  const email = text(formData, "email").trim().toLowerCase();
++  const password = text(formData, "password");
++  const values = { email };
++
++  if (!email || !password) {
++    return { errors: { form: "Enter your email and password." }, values };
++  }
++
++  const key = await clientKey(email);
++  if (isThrottled(key)) {
++    return { errors: { form: "Too many attempts. Wait a few minutes and try again." }, values };
++  }
++
++  let userId: string | null = null;
++  try {
++    const user = await findUserByEmail(email);
++    if (user && (await verifyPassword(password, user.passwordHash))) userId = user.id;
++    else if (!user) await verifyAgainstDecoy(password);
++  } catch (err) {
++    console.error("[login] lookup failed", err);
++    return { errors: { form: "We couldn't log you in right now. Try again in a moment." }, values };
++  }
++
++  if (!userId) {
++    recordFailure(key);
++    return { errors: { form: "That email and password don't match an account." }, values };
++  }
++
++  clearFailures(key);
++  await createSession(userId);
++  redirect("/dashboard");
++}
++
++export async function logout(): Promise<void> {
++  await deleteSession();
++  redirect("/");
++}
+diff --git a/src/app/api/fx/route.ts b/src/app/api/fx/route.ts
+new file mode 100644
+index 0000000..0f08fde
+--- /dev/null
++++ b/src/app/api/fx/route.ts
+@@ -0,0 +1,11 @@
++import { getFxRates } from "@/lib/fx";
++
++export async function GET() {
++  try {
++    const data = await getFxRates();
++    return Response.json(data, { headers: { "Cache-Control": "no-store" } });
++  } catch (err) {
++    console.error("[api/fx]", err);
++    return Response.json({ error: "Currency rates are unavailable." }, { status: 502 });
++  }
++}
+diff --git a/src/app/api/history/route.ts b/src/app/api/history/route.ts
+new file mode 100644
+index 0000000..120f775
+--- /dev/null
++++ b/src/app/api/history/route.ts
+@@ -0,0 +1,16 @@
++import type { NextRequest } from "next/server";
++import { getHistory } from "@/lib/history";
++
++export async function GET(request: NextRequest) {
++  const id = request.nextUrl.searchParams.get("id") ?? "";
++  try {
++    const data = await getHistory(id);
++    if (!data) return Response.json({ error: "Unknown market." }, { status: 404 });
++    return Response.json(data, {
++      headers: { "Cache-Control": "public, max-age=30, s-maxage=60" },
++    });
++  } catch (err) {
++    console.error("[api/history]", id, err);
++    return Response.json({ error: "Price history is unavailable." }, { status: 502 });
++  }
++}
+diff --git a/src/app/dashboard/page.tsx b/src/app/dashboard/page.tsx
+new file mode 100644
+index 0000000..f0a535a
+--- /dev/null
++++ b/src/app/dashboard/page.tsx
+@@ -0,0 +1,16 @@
++import type { Metadata } from "next";
++import { DashboardView } from "@/components/dashboard/dashboard-view";
++import { requireUser } from "@/lib/auth/dal";
++
++export const metadata: Metadata = { title: "Dashboard | modv" };
++
++export default async function DashboardPage() {
++  const user = await requireUser();
++  return (
++    <DashboardView
++      name={user.name}
++      accountNo={user.accountNo}
++      balanceCents={user.balanceCents}
++    />
++  );
++}
+diff --git a/src/app/globals.css b/src/app/globals.css
+index c56032b..df59990 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -10,6 +10,17 @@
+   --font-sans: var(--font-sans);
+   --font-mono: var(--font-geist-mono);
+   --font-heading: var(--font-sans);
++  --font-display: var(--font-display);
++  --color-signal: var(--signal);
++  --color-board: var(--board);
++  --color-flap: var(--flap);
++  --color-flap-edge: var(--flap-edge);
++  --color-chalk: var(--chalk);
++  --color-chalk-dim: var(--chalk-dim);
++  --color-up: var(--up);
++  --color-down: var(--down);
++  --color-up-ink: var(--up-ink);
++  --color-down-ink: var(--down-ink);
+   --color-sidebar-ring: var(--sidebar-ring);
+   --color-sidebar-border: var(--sidebar-border);
+   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+@@ -49,30 +60,31 @@
+ }
+ 
+ :root {
+-  --background: oklch(1 0 0);
+-  --foreground: oklch(0.145 0 0);
+-  --card: oklch(1 0 0);
+-  --card-foreground: oklch(0.145 0 0);
+-  --popover: oklch(1 0 0);
+-  --popover-foreground: oklch(0.145 0 0);
+-  --primary: oklch(0.205 0 0);
+-  --primary-foreground: oklch(0.985 0 0);
+-  --secondary: oklch(0.97 0 0);
+-  --secondary-foreground: oklch(0.205 0 0);
+-  --muted: oklch(0.97 0 0);
+-  --muted-foreground: oklch(0.556 0 0);
+-  --accent: oklch(0.97 0 0);
+-  --accent-foreground: oklch(0.205 0 0);
+-  --destructive: oklch(0.577 0.245 27.325);
+-  --border: oklch(0.922 0 0);
+-  --input: oklch(0.922 0 0);
+-  --ring: oklch(0.708 0 0);
++  /* Counter: a cool paper page with ink type. */
++  --background: #e9ecef;
++  --foreground: #10141a;
++  --card: #f6f7f8;
++  --card-foreground: #10141a;
++  --popover: #f6f7f8;
++  --popover-foreground: #10141a;
++  --primary: #10141a;
++  --primary-foreground: #f6f7f8;
++  --secondary: #dde1e5;
++  --secondary-foreground: #10141a;
++  --muted: #dde1e5;
++  --muted-foreground: #58626e;
++  --accent: #dde1e5;
++  --accent-foreground: #10141a;
++  --destructive: #b8321f;
++  --border: #cbd1d8;
++  --input: #b4bcc5;
++  --ring: #10141a;
+   --chart-1: oklch(0.87 0 0);
+   --chart-2: oklch(0.556 0 0);
+   --chart-3: oklch(0.439 0 0);
+   --chart-4: oklch(0.371 0 0);
+   --chart-5: oklch(0.269 0 0);
+-  --radius: 0.625rem;
++  --radius: 0.5rem;
+   --sidebar: oklch(0.985 0 0);
+   --sidebar-foreground: oklch(0.145 0 0);
+   --sidebar-primary: oklch(0.205 0 0);
+@@ -81,6 +93,18 @@
+   --sidebar-accent-foreground: oklch(0.205 0 0);
+   --sidebar-border: oklch(0.922 0 0);
+   --sidebar-ring: oklch(0.708 0 0);
++
++  /* Board: the split-flap display that carries the live prices. */
++  --signal: #ffd11a;
++  --board: #12151a;
++  --flap: #1d2128;
++  --flap-edge: #0a0c0f;
++  --chalk: #efebdd;
++  --chalk-dim: #8f9aa6;
++  --up: #35d69a;
++  --down: #ff7566;
++  --up-ink: #0a7a52;
++  --down-ink: #b8321f;
+ }
+ 
+ .dark {
+@@ -127,4 +151,39 @@
+   html {
+     @apply font-sans;
+   }
+-}
+\ No newline at end of file
++}
++
++@layer base {
++  html {
++    color-scheme: light;
++  }
++  :focus-visible {
++    outline: 2px solid var(--foreground);
++    outline-offset: 2px;
++  }
++}
++
++/* A character drops into place from the top edge, like a split-flap tile. */
++@keyframes flap-drop {
++  from {
++    transform: rotateX(-88deg);
++    opacity: 0.15;
++  }
++  to {
++    transform: rotateX(0deg);
++    opacity: 1;
++  }
++}
++
++.flap-char {
++  display: inline-block;
++  transform-origin: 50% 0%;
++  backface-visibility: hidden;
++  animation: flap-drop 280ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .flap-char {
++    animation: none;
++  }
++}
+diff --git a/src/app/layout.tsx b/src/app/layout.tsx
+index 9852c15..ff5c38e 100644
+--- a/src/app/layout.tsx
++++ b/src/app/layout.tsx
+@@ -1,29 +1,38 @@
+ import type { Metadata } from "next";
+-import { Geist, Geist_Mono } from "next/font/google";
++import { Barlow_Condensed, Geist_Mono, Instrument_Sans } from "next/font/google";
+ import "./globals.css";
+ 
+-const geistSans = Geist({
+-  variable: "--font-geist-sans",
++const sans = Instrument_Sans({
++  variable: "--font-sans",
+   subsets: ["latin"],
+ });
+ 
++const display = Barlow_Condensed({
++  variable: "--font-display",
++  subsets: ["latin"],
++  weight: ["500", "600", "700"],
++});
++
+ const geistMono = Geist_Mono({
+   variable: "--font-geist-mono",
+   subsets: ["latin"],
+ });
+ 
+ export const metadata: Metadata = {
+-  title: "Create Next App",
+-  description: "Generated by create next app",
++  title: "modv | Currencies and crypto on one live board",
++  description:
++    "Live crypto prices and major currency pairs on one board, with every price labelled by its source. Open an account for your own dashboard.",
+ };
+ 
+ export default function RootLayout({ children }: LayoutProps<"/">) {
+   return (
+     <html
+       lang="en"
+-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
++      className={`${sans.variable} ${display.variable} ${geistMono.variable} h-full antialiased`}
+     >
+-      <body className="min-h-full flex flex-col">{children}</body>
++      <body className="flex min-h-full flex-col bg-background font-sans text-foreground">
++        {children}
++      </body>
+     </html>
+   );
+ }
+diff --git a/src/app/login/page.tsx b/src/app/login/page.tsx
+new file mode 100644
+index 0000000..3d838c7
+--- /dev/null
++++ b/src/app/login/page.tsx
+@@ -0,0 +1,16 @@
++import type { Metadata } from "next";
++import { redirect } from "next/navigation";
++import { AuthForm } from "@/components/auth/auth-form";
++import { AuthShell } from "@/components/auth/auth-shell";
++import { getCurrentUser } from "@/lib/auth/dal";
++
++export const metadata: Metadata = { title: "Log in | modv" };
++
++export default async function LoginPage() {
++  if (await getCurrentUser()) redirect("/dashboard");
++  return (
++    <AuthShell title="Log in" intro="Pick up where you left off.">
++      <AuthForm mode="login" />
++    </AuthShell>
++  );
++}
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index c887311..8e54b47 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -1,69 +1,113 @@
+-import Image from "next/image";
++import Link from "next/link";
++import { Wordmark } from "@/components/brand/wordmark";
++import { LiveBoard } from "@/components/market/live-board";
++import { cn } from "@/lib/utils";
++
++const button =
++  "inline-flex h-12 items-center justify-center rounded-lg px-6 text-base font-semibold transition-colors";
++const buttonSignal = cn(button, "bg-signal text-foreground hover:bg-signal/85");
++const buttonInk = cn(button, "bg-foreground text-background hover:bg-foreground/85");
++const buttonOutline = cn(button, "border border-foreground/25 bg-card text-foreground hover:bg-secondary");
++
++const points = [
++  {
++    title: "Two markets, one board",
++    body: "Six major currency pairs and four large cryptocurrencies sit side by side, so you can compare a move in the euro with a move in bitcoin without switching tabs.",
++  },
++  {
++    title: "Every price shows its source",
++    body: "Crypto streams from Coinbase as trades happen. Currency rates say where they come from and how old they are, so you always know what you're looking at.",
++  },
++  {
++    title: "A dashboard from day one",
++    body: "Open an account and you land on your balance, the live board, and a chart for any market you click.",
++  },
++];
+ 
+ export default function Home() {
+   return (
+-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
+-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
+-        <Image
+-          className="dark:invert h-5 w-[100px]"
+-          src="/next.svg"
+-          alt="Next.js logo"
+-          width={100}
+-          height={20}
+-          priority
+-        />
+-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
+-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
+-            To get started, edit the{" "}
+-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
+-              page.tsx
+-            </code>{" "}
+-            file.
+-          </h1>
+-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
+-            Looking for a starting point or more instructions? Head over to{" "}
+-            <a
+-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
+-              className="font-medium text-zinc-950 dark:text-zinc-50"
+-            >
+-              Templates
+-            </a>{" "}
+-            or the{" "}
+-            <a
+-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
+-              className="font-medium text-zinc-950 dark:text-zinc-50"
++    <>
++      <div className="mx-auto w-full max-w-[1240px] px-5 sm:px-8">
++        <header className="flex items-center justify-between py-5">
++          <Wordmark />
++          <nav aria-label="Account" className="flex items-center gap-2 sm:gap-3">
++            <Link
++              href="/login"
++              className="rounded-lg px-3 py-2 text-[0.95rem] font-medium hover:bg-secondary"
+             >
+-              Learning
+-            </a>{" "}
+-            center.
+-          </p>
++              Log in
++            </Link>
++            <Link href="/signup" className={cn(buttonSignal, "h-10 px-4 text-[0.95rem]")}>
++              Open account
++            </Link>
++          </nav>
++        </header>
++
++        <main>
++          <section className="grid items-start gap-10 pt-8 pb-20 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:gap-14 lg:pt-14 lg:pb-28">
++            <div className="lg:sticky lg:top-10">
++              <h1 className="font-display text-[clamp(3.4rem,8.4vw,6.4rem)] leading-[0.92] font-semibold tracking-tight">
++                Currencies and crypto on one live board.
++              </h1>
++              <p className="mt-6 max-w-[40ch] text-lg leading-relaxed text-muted-foreground">
++                Watch the euro, the yen, bitcoin and more move in real time, with every price labelled
++                by where it comes from. Open an account to get your own dashboard.
++              </p>
++              <div className="mt-8 flex flex-wrap gap-3">
++                <Link href="/signup" className={buttonSignal}>
++                  Open an account
++                </Link>
++                <Link href="/login" className={buttonOutline}>
++                  Log in
++                </Link>
++              </div>
++              <p className="mt-5 text-sm text-muted-foreground">
++                This is a test environment. Balances are virtual and no real money moves.
++              </p>
++            </div>
++
++            <LiveBoard />
++          </section>
++
++          <section aria-labelledby="why-heading" className="border-t border-border py-16 lg:py-20">
++            <h2 id="why-heading" className="sr-only">
++              What you get
++            </h2>
++            <dl className="divide-y divide-border border-y border-border">
++              {points.map((p) => (
++                <div
++                  key={p.title}
++                  className="grid gap-2 py-7 md:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] md:gap-14"
++                >
++                  <dt className="font-display text-[2rem] leading-[1.05] font-semibold">{p.title}</dt>
++                  <dd className="max-w-[58ch] text-lg leading-relaxed text-muted-foreground">{p.body}</dd>
++                </div>
++              ))}
++            </dl>
++          </section>
++        </main>
++      </div>
++
++      <section className="bg-signal">
++        <div className="mx-auto flex w-full max-w-[1240px] flex-col items-start justify-between gap-6 px-5 py-14 sm:px-8 md:flex-row md:items-center">
++          <h2 className="max-w-[18ch] font-display text-[clamp(2.4rem,5vw,3.6rem)] leading-[0.95] font-semibold tracking-tight">
++            Your dashboard is one form away.
++          </h2>
++          <Link href="/signup" className={buttonInk}>
++            Open an account
++          </Link>
+         </div>
+-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
+-          <a
+-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
+-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
+-            target="_blank"
+-            rel="noopener noreferrer"
+-          >
+-            <Image
+-              className="dark:invert h-[14px] w-4"
+-              src="/vercel.svg"
+-              alt="Vercel logomark"
+-              width={16}
+-              height={14}
+-            />
+-            Deploy Now
+-          </a>
+-          <a
+-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
+-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
+-            target="_blank"
+-            rel="noopener noreferrer"
+-          >
+-            Documentation
+-          </a>
++      </section>
++
++      <footer className="mx-auto w-full max-w-[1240px] px-5 py-10 text-sm text-muted-foreground sm:px-8">
++        <div className="flex flex-col justify-between gap-6 md:flex-row">
++          <Wordmark />
++          <p className="max-w-[62ch] leading-relaxed">
++            modv is an experiment, not a licensed broker. Prices are indicative and are not tradable
++            quotes. Trading currencies and crypto carries a high risk of loss.
++          </p>
+         </div>
+-      </main>
+-    </div>
++      </footer>
++    </>
+   );
+ }
+diff --git a/src/app/signup/page.tsx b/src/app/signup/page.tsx
+new file mode 100644
+index 0000000..7dddfcc
+--- /dev/null
++++ b/src/app/signup/page.tsx
+@@ -0,0 +1,19 @@
++import type { Metadata } from "next";
++import { redirect } from "next/navigation";
++import { AuthForm } from "@/components/auth/auth-form";
++import { AuthShell } from "@/components/auth/auth-shell";
++import { getCurrentUser } from "@/lib/auth/dal";
++
++export const metadata: Metadata = { title: "Open an account | modv" };
++
++export default async function SignupPage() {
++  if (await getCurrentUser()) redirect("/dashboard");
++  return (
++    <AuthShell
++      title="Open your account"
++      intro="You'll start with a virtual balance and a live dashboard."
++    >
++      <AuthForm mode="signup" />
++    </AuthShell>
++  );
++}
+diff --git a/src/components/auth/auth-form.tsx b/src/components/auth/auth-form.tsx
+new file mode 100644
+index 0000000..fa74cce
+--- /dev/null
++++ b/src/components/auth/auth-form.tsx
+@@ -0,0 +1,140 @@
++"use client";
++
++import Link from "next/link";
++import { useActionState } from "react";
++import { login, signup } from "@/app/actions/auth";
++import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { Label } from "@/components/ui/label";
++import { cn } from "@/lib/utils";
++
++const COPY = {
++  signup: {
++    submit: "Open account",
++    pending: "Opening account",
++    switchText: "Already have an account?",
++    switchLink: "Log in",
++    switchHref: "/login",
++  },
++  login: {
++    submit: "Log in",
++    pending: "Logging in",
++    switchText: "New to modv?",
++    switchLink: "Open an account",
++    switchHref: "/signup",
++  },
++} as const;
++
++export function AuthForm({ mode }: { mode: "login" | "signup" }) {
++  const [state, action, pending] = useActionState(mode === "signup" ? signup : login, undefined);
++  const copy = COPY[mode];
++  const errors = state?.errors;
++
++  return (
++    <form action={action} className="grid gap-5" noValidate>
++      {errors?.form && (
++        <p
++          role="alert"
++          className="rounded-lg border border-destructive/30 bg-destructive/[0.07] px-3 py-2.5 text-sm text-destructive"
++        >
++          {errors.form}
++        </p>
++      )}
++
++      {mode === "signup" && (
++        <Field id="name" label="Full name" error={errors?.name}>
++          <Input
++            id="name"
++            name="name"
++            autoComplete="name"
++            defaultValue={state?.values?.name}
++            aria-invalid={!!errors?.name}
++            aria-describedby={errors?.name ? "name-error" : undefined}
++            className="h-11 bg-card"
++            required
++          />
++        </Field>
++      )}
++
++      <Field id="email" label="Email" error={errors?.email}>
++        <Input
++          id="email"
++          name="email"
++          type="email"
++          autoComplete="email"
++          inputMode="email"
++          defaultValue={state?.values?.email}
++          aria-invalid={!!errors?.email}
++          aria-describedby={errors?.email ? "email-error" : undefined}
++          className="h-11 bg-card"
++          required
++        />
++      </Field>
++
++      <Field
++        id="password"
++        label="Password"
++        error={errors?.password}
++        hint={mode === "signup" ? "At least 8 characters." : undefined}
++      >
++        <Input
++          id="password"
++          name="password"
++          type="password"
++          autoComplete={mode === "signup" ? "new-password" : "current-password"}
++          aria-invalid={!!errors?.password}
++          aria-describedby={errors?.password ? "password-error" : mode === "signup" ? "password-hint" : undefined}
++          className="h-11 bg-card"
++          required
++        />
++      </Field>
++
++      <Button
++        type="submit"
++        disabled={pending}
++        className="h-11 w-full bg-signal text-base font-semibold text-foreground hover:bg-signal/85"
++      >
++        {pending ? `${copy.pending}...` : copy.submit}
++      </Button>
++
++      <p className="text-sm text-muted-foreground">
++        {copy.switchText}{" "}
++        <Link href={copy.switchHref} className="font-medium text-foreground underline underline-offset-4">
++          {copy.switchLink}
++        </Link>
++      </p>
++    </form>
++  );
++}
++
++function Field({
++  id,
++  label,
++  error,
++  hint,
++  children,
++}: {
++  id: string;
++  label: string;
++  error?: string;
++  hint?: string;
++  children: React.ReactNode;
++}) {
++  return (
++    <div className="grid gap-2">
++      <Label htmlFor={id} className="text-[0.92rem]">
++        {label}
++      </Label>
++      {children}
++      {error ? (
++        <p id={`${id}-error`} className="text-sm text-destructive">
++          {error}
++        </p>
++      ) : hint ? (
++        <p id={`${id}-hint`} className={cn("text-sm text-muted-foreground")}>
++          {hint}
++        </p>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/src/components/auth/auth-shell.tsx b/src/components/auth/auth-shell.tsx
+new file mode 100644
+index 0000000..7465046
+--- /dev/null
++++ b/src/components/auth/auth-shell.tsx
+@@ -0,0 +1,41 @@
++import { Wordmark } from "@/components/brand/wordmark";
++import { LiveBoard } from "@/components/market/live-board";
++
++/** Split screen: the live board on the left (large screens), the form on the right. */
++export function AuthShell({
++  title,
++  intro,
++  children,
++}: {
++  title: string;
++  intro: string;
++  children: React.ReactNode;
++}) {
++  return (
++    <div className="grid min-h-dvh lg:grid-cols-2">
++      <aside className="hidden flex-col justify-between gap-10 bg-board p-10 text-chalk lg:flex xl:p-14">
++        <Wordmark tone="chalk" />
++        <div className="grid gap-6">
++          <p className="max-w-[16ch] font-display text-[3.4rem] leading-[0.95] font-semibold tracking-tight">
++            The board keeps moving while you sign up.
++          </p>
++          <LiveBoard
++            compact
++            ids={["BTCUSD", "ETHUSD", "EURUSD", "GBPUSD", "USDJPY"]}
++            className="ring-1 ring-white/10"
++          />
++        </div>
++        <p className="text-sm text-chalk-dim">Test environment. Balances are virtual.</p>
++      </aside>
++
++      <main className="flex flex-col px-5 py-6 sm:px-10">
++        <Wordmark className="lg:hidden" />
++        <div className="m-auto w-full max-w-[26rem] py-10">
++          <h1 className="font-display text-[2.6rem] leading-none font-semibold tracking-tight">{title}</h1>
++          <p className="mt-3 mb-8 text-muted-foreground">{intro}</p>
++          {children}
++        </div>
++      </main>
++    </div>
++  );
++}
+diff --git a/src/components/brand/wordmark.tsx b/src/components/brand/wordmark.tsx
+new file mode 100644
+index 0000000..62eb622
+--- /dev/null
++++ b/src/components/brand/wordmark.tsx
+@@ -0,0 +1,29 @@
++import Link from "next/link";
++import { cn } from "@/lib/utils";
++
++/** The mark is a single flap tile: a signal square split by the flap line. */
++export function Wordmark({
++  tone = "ink",
++  className,
++}: {
++  tone?: "ink" | "chalk";
++  className?: string;
++}) {
++  return (
++    <Link
++      href="/"
++      aria-label="modv home"
++      className={cn(
++        "inline-flex items-center gap-2 font-display text-[1.7rem] font-bold leading-none tracking-tight",
++        tone === "ink" ? "text-foreground" : "text-chalk",
++        className,
++      )}
++    >
++      <span
++        aria-hidden
++        className="relative block size-[1.05rem] rounded-[3px] bg-signal after:absolute after:inset-x-0 after:top-1/2 after:h-px after:bg-foreground/70"
++      />
++      modv
++    </Link>
++  );
++}
+diff --git a/src/components/dashboard/dashboard-view.tsx b/src/components/dashboard/dashboard-view.tsx
+new file mode 100644
+index 0000000..6b93f4f
+--- /dev/null
++++ b/src/components/dashboard/dashboard-view.tsx
+@@ -0,0 +1,177 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import { logout } from "@/app/actions/auth";
++import { Wordmark } from "@/components/brand/wordmark";
++import { PriceChart } from "@/components/market/price-chart";
++import { RateBoard } from "@/components/market/rate-board";
++import { Button } from "@/components/ui/button";
++import { useLiveMarkets } from "@/hooks/use-live-markets";
++import {
++  INSTRUMENTS,
++  formatChange,
++  formatPrice,
++  formatUsd,
++  getInstrument,
++  type HistoryPayload,
++} from "@/lib/markets";
++import { cn } from "@/lib/utils";
++
++interface DashboardViewProps {
++  name: string;
++  accountNo: string;
++  balanceCents: number;
++}
++
++type HistoryState =
++  | { id: string; status: "loading" }
++  | { id: string; status: "error" }
++  | { id: string; status: "ready"; data: HistoryPayload };
++
++function useHistory(id: string): HistoryState {
++  const [state, setState] = useState<HistoryState>({ id, status: "loading" });
++
++  useEffect(() => {
++    let disposed = false;
++    fetch(`/api/history?id=${encodeURIComponent(id)}`)
++      .then((res) => (res.ok ? (res.json() as Promise<HistoryPayload>) : Promise.reject(new Error(String(res.status)))))
++      .then((data) => !disposed && setState({ id, status: "ready", data }))
++      .catch(() => !disposed && setState({ id, status: "error" }));
++    return () => {
++      disposed = true;
++    };
++  }, [id]);
++
++  // While a newly selected market loads, show loading rather than the previous chart.
++  return state.id === id ? state : { id, status: "loading" };
++}
++
++export function DashboardView({ name, accountNo, balanceCents }: DashboardViewProps) {
++  const markets = useLiveMarkets();
++  const [selectedId, setSelectedId] = useState("BTCUSD");
++  const inst = getInstrument(selectedId) ?? INSTRUMENTS[0];
++  const quote = markets.quotes[inst.id];
++  const history = useHistory(inst.id);
++
++  const change = quote?.changePct ?? null;
++  const firstName = name.split(" ")[0];
++
++  return (
++    <div className="mx-auto w-full max-w-[1280px] px-5 pb-16 sm:px-8">
++      <header className="flex items-center justify-between gap-4 py-5">
++        <Wordmark />
++        <div className="flex items-center gap-4">
++          <div className="hidden text-right text-sm leading-tight sm:block">
++            <div className="font-medium">{name}</div>
++            <div className="text-muted-foreground tabular-nums">{accountNo}</div>
++          </div>
++          <form action={logout}>
++            <Button type="submit" variant="outline" className="h-9 bg-card px-3.5">
++              Log out
++            </Button>
++          </form>
++        </div>
++      </header>
++
++      <section aria-labelledby="account-heading" className="border-t border-border pt-7 pb-8">
++        <h1 id="account-heading" className="sr-only">
++          {firstName}&apos;s account
++        </h1>
++        <dl className="grid gap-x-10 gap-y-6 sm:grid-cols-2 lg:grid-cols-[1.6fr_1fr_1fr_1fr]">
++          <div className="sm:col-span-2 lg:col-span-1">
++            <dt className="text-sm text-muted-foreground">Virtual balance</dt>
++            <dd className="mt-1 font-display text-[3.4rem] leading-none font-semibold tracking-tight tabular-nums sm:text-[4.4rem]">
++              {formatUsd(balanceCents)}
++            </dd>
++          </div>
++          <Stat label="Equity" value={formatUsd(balanceCents)} />
++          <Stat label="Open profit and loss" value={formatUsd(0)} />
++          <Stat label="Open positions" value="0" />
++        </dl>
++      </section>
++
++      <div className="grid gap-8 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:gap-10">
++        <RateBoard
++          {...markets}
++          selectedId={inst.id}
++          onSelect={setSelectedId}
++          className="self-start"
++        />
++
++        <div className="min-w-0">
++          <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-2 border-t border-border pt-4">
++            <div>
++              <h2 className="font-display text-[2.2rem] leading-none font-semibold">{inst.label}</h2>
++              <p className="mt-1 text-sm text-muted-foreground">{inst.name}</p>
++            </div>
++            <div className="text-right">
++              <div className="font-display text-[2.2rem] leading-none font-medium tabular-nums">
++                {quote ? formatPrice(quote.price, inst.decimals) : "-"}
++              </div>
++              <div
++                className={cn(
++                  "mt-1 text-sm font-medium tabular-nums",
++                  change === null || Math.abs(change) < 0.005
++                    ? "text-muted-foreground"
++                    : change > 0
++                      ? "text-up-ink"
++                      : "text-down-ink",
++                )}
++              >
++                {formatChange(change)} {inst.cls === "crypto" ? "in 24 hours" : "since the last close"}
++              </div>
++            </div>
++          </div>
++
++          <div className="mt-5">
++            {history.status === "ready" && history.data.points.length > 1 ? (
++              <PriceChart
++                key={inst.id}
++                points={history.data.points}
++                interval={history.data.interval}
++                decimals={inst.decimals}
++                label={inst.label}
++                livePrice={quote?.price ?? null}
++                liveTs={quote?.ts ?? null}
++              />
++            ) : (
++              <div
++                className="grid place-items-center rounded-lg border border-dashed border-border text-sm text-muted-foreground"
++                style={{ height: 320 }}
++              >
++                {history.status === "error"
++                  ? "We couldn't load the price history for this market. Live prices still update on the board."
++                  : "Loading price history"}
++              </div>
++            )}
++          </div>
++          <p className="mt-2 text-xs text-muted-foreground">
++            {inst.cls === "crypto"
++              ? "Five-minute closes for the last 25 hours from Coinbase, extended live."
++              : "Daily closes for the last six weeks from the European Central Bank."}{" "}
++            Hover the chart to read a price.
++          </p>
++
++          <section aria-labelledby="positions-heading" className="mt-10 border-t border-border pt-4">
++            <h2 id="positions-heading" className="font-display text-[1.6rem] leading-none font-semibold">
++              Open positions
++            </h2>
++            <p className="mt-3 max-w-[52ch] text-muted-foreground">
++              You have no open positions. Trading isn&apos;t switched on in this test build yet, so your
++              balance stays where it is.
++            </p>
++          </section>
++        </div>
++      </div>
++    </div>
++  );
++}
++
++function Stat({ label, value }: { label: string; value: string }) {
++  return (
++    <div className="lg:self-end">
++      <dt className="text-sm text-muted-foreground">{label}</dt>
++      <dd className="mt-1 font-display text-[2rem] leading-none font-medium tabular-nums">{value}</dd>
++    </div>
++  );
++}
+diff --git a/src/components/market/flap-price.tsx b/src/components/market/flap-price.tsx
+new file mode 100644
+index 0000000..f440a7b
+--- /dev/null
++++ b/src/components/market/flap-price.tsx
+@@ -0,0 +1,65 @@
++import { cn } from "@/lib/utils";
++
++interface FlapPriceProps {
++  /** Formatted price, or null while waiting for the first quote. */
++  text: string | null;
++  tone: "idle" | "up" | "down";
++  /** Stagger for the first appearance, in ms. Zero once the intro is over. */
++  introDelay?: number;
++  className?: string;
++}
++
++const PLACEHOLDER = "-------";
++
++/**
++ * A price drawn as split-flap tiles. Cells are keyed from the right so a tile
++ * keeps its identity when the number grows a digit, and only tiles whose
++ * character changed remount and play the drop animation.
++ */
++export function FlapPrice({ text, tone, introDelay = 0, className }: FlapPriceProps) {
++  const chars = [...(text ?? PLACEHOLDER)];
++  const waiting = text === null;
++
++  return (
++    <span
++      className={cn(
++        "inline-flex items-center gap-[2px] font-display font-medium leading-none [perspective:400px]",
++        "transition-colors duration-500",
++        tone === "up" && "text-up",
++        tone === "down" && "text-down",
++        tone === "idle" && "text-chalk",
++        waiting && "text-chalk-dim/40",
++        className,
++      )}
++    >
++      <span className="sr-only">{text ?? "Waiting for price"}</span>
++      {chars.map((ch, i) => {
++        const fromRight = chars.length - 1 - i;
++        const separator = ch === "," || ch === ".";
++        return (
++          <span
++            key={fromRight}
++            aria-hidden
++            className={cn(
++              "relative inline-flex h-[1.5em] items-center justify-center",
++              separator
++                ? "w-[0.3em]"
++                : "w-[0.66em] rounded-[3px] bg-flap shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]",
++            )}
++          >
++            <span
++              key={ch}
++              className={cn(!waiting && "flap-char", separator && "translate-y-[0.14em]")}
++              style={introDelay ? { animationDelay: `${introDelay + i * 16}ms` } : undefined}
++            >
++              {ch}
++            </span>
++            {!separator && (
++              <span className="pointer-events-none absolute inset-x-0 top-1/2 h-px bg-flap-edge" />
++            )}
++          </span>
++        );
++      })}
++    </span>
++  );
++}
+diff --git a/src/components/market/live-board.tsx b/src/components/market/live-board.tsx
+new file mode 100644
+index 0000000..dbe0d92
+--- /dev/null
++++ b/src/components/market/live-board.tsx
+@@ -0,0 +1,10 @@
++"use client";
++
++import { useLiveMarkets } from "@/hooks/use-live-markets";
++import { RateBoard } from "./rate-board";
++
++/** A self-contained board for pages that only display prices (landing, sign-in). */
++export function LiveBoard(props: { ids?: readonly string[]; compact?: boolean; className?: string }) {
++  const markets = useLiveMarkets();
++  return <RateBoard {...markets} {...props} />;
++}
+diff --git a/src/components/market/price-chart.tsx b/src/components/market/price-chart.tsx
+new file mode 100644
+index 0000000..2982ff5
+--- /dev/null
++++ b/src/components/market/price-chart.tsx
+@@ -0,0 +1,203 @@
++"use client";
++
++import { useEffect, useMemo, useRef, useState } from "react";
++import { formatPrice } from "@/lib/markets";
++
++type Point = [number, number];
++
++interface PriceChartProps {
++  /** Historical points, oldest first. */
++  points: Point[];
++  interval: "5m" | "1d";
++  decimals: number;
++  label: string;
++  /** Latest live price and when it was struck. Appended to the history as it changes. */
++  livePrice: number | null;
++  liveTs: number | null;
++}
++
++const HEIGHT = 320;
++const PAD = { top: 16, right: 72, bottom: 30 };
++/** Live ticks closer together than this replace each other, to keep the tail light. */
++const TAIL_GAP_MS = 3_000;
++const TAIL_MAX = 600;
++
++function appendTail(tail: Point[], point: Point): Point[] {
++  const last = tail[tail.length - 1];
++  const next =
++    last && point[0] - last[0] < TAIL_GAP_MS ? [...tail.slice(0, -1), point] : [...tail, point];
++  return next.length > TAIL_MAX ? next.slice(next.length - TAIL_MAX) : next;
++}
++
++export function PriceChart({ points, interval, decimals, label, livePrice, liveTs }: PriceChartProps) {
++  const [tail, setTail] = useState<Point[]>([]);
++  const [seenTs, setSeenTs] = useState<number | null>(null);
++  if (livePrice !== null && liveTs !== null && liveTs !== seenTs) {
++    setSeenTs(liveTs);
++    setTail((t) => appendTail(t, [liveTs, livePrice]));
++  }
++
++  const series = useMemo(() => {
++    const lastHistory = points.length ? points[points.length - 1][0] : 0;
++    return [...points, ...tail.filter((p) => p[0] > lastHistory)];
++  }, [points, tail]);
++
++  const wrapRef = useRef<HTMLDivElement>(null);
++  const [width, setWidth] = useState(0);
++  useEffect(() => {
++    const el = wrapRef.current;
++    if (!el) return;
++    const observer = new ResizeObserver(([entry]) => setWidth(Math.floor(entry.contentRect.width)));
++    observer.observe(el);
++    return () => observer.disconnect();
++  }, []);
++
++  const [hover, setHover] = useState<number | null>(null);
++
++  const geometry = useMemo(() => {
++    if (width <= 0 || series.length < 2) return null;
++    const t0 = series[0][0];
++    const t1 = series[series.length - 1][0];
++    const plotW = width - PAD.right;
++    const plotH = HEIGHT - PAD.top - PAD.bottom;
++
++    let lo = Infinity;
++    let hi = -Infinity;
++    for (const [, v] of series) {
++      if (v < lo) lo = v;
++      if (v > hi) hi = v;
++    }
++    const span = hi - lo || hi * 0.001 || 1;
++    lo -= span * 0.08;
++    hi += span * 0.08;
++
++    const x = (t: number) => ((t - t0) / (t1 - t0 || 1)) * plotW;
++    const y = (v: number) => PAD.top + (1 - (v - lo) / (hi - lo)) * plotH;
++    const xs = series.map(([t]) => x(t));
++    const line = series.map(([t, v], i) => `${i ? "L" : "M"}${x(t).toFixed(1)} ${y(v).toFixed(1)}`).join("");
++    const base = PAD.top + plotH;
++    const area = `${line}L${plotW.toFixed(1)} ${base}L0 ${base}Z`;
++    const grid = [0.2, 0.4, 0.6, 0.8].map((f) => {
++      const v = lo + f * (hi - lo);
++      return { y: y(v), v };
++    });
++    return { t0, t1, plotW, plotH, x, y, xs, line, area, grid, base };
++  }, [width, series]);
++
++  const timeFmt = useMemo(
++    () =>
++      new Intl.DateTimeFormat(
++        undefined,
++        interval === "5m"
++          ? { hour: "2-digit", minute: "2-digit" }
++          : { day: "numeric", month: "short" },
++      ),
++    [interval],
++  );
++  const fullFmt = useMemo(
++    () =>
++      new Intl.DateTimeFormat(
++        undefined,
++        interval === "5m"
++          ? { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }
++          : { day: "numeric", month: "short", year: "numeric" },
++      ),
++    [interval],
++  );
++
++  const rising = series.length > 1 && series[series.length - 1][1] >= series[0][1];
++  const stroke = rising ? "var(--up-ink)" : "var(--down-ink)";
++
++  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
++    if (!geometry) return;
++    const px = e.clientX - e.currentTarget.getBoundingClientRect().left;
++    if (px > geometry.plotW) return setHover(null);
++    // Nearest point by x. A linear scan is fine for a few hundred points.
++    let best = 0;
++    let bestDist = Infinity;
++    for (let i = 0; i < geometry.xs.length; i++) {
++      const d = Math.abs(geometry.xs[i] - px);
++      if (d < bestDist) {
++        bestDist = d;
++        best = i;
++      }
++    }
++    setHover(best);
++  };
++
++  const hovered = hover !== null && geometry && series[hover] ? series[hover] : null;
++
++  return (
++    <div ref={wrapRef} className="relative w-full" style={{ height: HEIGHT }}>
++      {geometry && (
++        <svg
++          width={width}
++          height={HEIGHT}
++          role="img"
++          aria-label={`Price chart for ${label}`}
++          className="touch-pan-y select-none"
++          onPointerMove={onMove}
++          onPointerLeave={() => setHover(null)}
++        >
++          {geometry.grid.map((g) => (
++            <g key={g.y}>
++              <line x1={0} x2={geometry.plotW} y1={g.y} y2={g.y} stroke="var(--border)" strokeWidth={1} />
++              <text x={geometry.plotW + 10} y={g.y + 4} fontSize={12} fill="var(--muted-foreground)" className="tabular-nums">
++                {formatPrice(g.v, decimals)}
++              </text>
++            </g>
++          ))}
++          <path d={geometry.area} fill={stroke} opacity={0.07} />
++          <path d={geometry.line} fill="none" stroke={stroke} strokeWidth={1.75} strokeLinejoin="round" />
++
++          <text x={0} y={HEIGHT - 8} fontSize={12} fill="var(--muted-foreground)">
++            {timeFmt.format(geometry.t0)}
++          </text>
++          <text x={geometry.plotW / 2} y={HEIGHT - 8} fontSize={12} textAnchor="middle" fill="var(--muted-foreground)">
++            {timeFmt.format((geometry.t0 + geometry.t1) / 2)}
++          </text>
++          <text x={geometry.plotW} y={HEIGHT - 8} fontSize={12} textAnchor="end" fill="var(--muted-foreground)">
++            {timeFmt.format(geometry.t1)}
++          </text>
++
++          {/* Latest price marker */}
++          <circle
++            cx={geometry.xs[geometry.xs.length - 1]}
++            cy={geometry.y(series[series.length - 1][1])}
++            r={4.5}
++            fill="var(--signal)"
++            stroke="var(--foreground)"
++            strokeWidth={1.5}
++          />
++
++          {hovered && hover !== null && (
++            <g pointerEvents="none">
++              <line
++                x1={geometry.xs[hover]}
++                x2={geometry.xs[hover]}
++                y1={PAD.top}
++                y2={geometry.base}
++                stroke="var(--foreground)"
++                strokeWidth={1}
++                strokeDasharray="3 3"
++              />
++              <circle cx={geometry.xs[hover]} cy={geometry.y(hovered[1])} r={4} fill="var(--foreground)" />
++            </g>
++          )}
++        </svg>
++      )}
++
++      {hovered && hover !== null && geometry && (
++        <div
++          className="pointer-events-none absolute top-1 rounded-md bg-foreground px-2.5 py-1.5 text-background shadow-md"
++          style={{ left: Math.min(Math.max(geometry.xs[hover] + 10, 0), Math.max(geometry.plotW - 130, 0)) }}
++        >
++          <div className="font-display text-lg leading-none font-medium tabular-nums">
++            {formatPrice(hovered[1], decimals)}
++          </div>
++          <div className="mt-1 text-xs leading-none opacity-70">{fullFmt.format(hovered[0])}</div>
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/src/components/market/rate-board.tsx b/src/components/market/rate-board.tsx
+new file mode 100644
+index 0000000..1d5fdfe
+--- /dev/null
++++ b/src/components/market/rate-board.tsx
+@@ -0,0 +1,276 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import type { FeedState, FxStatus } from "@/hooks/use-live-markets";
++import {
++  INSTRUMENTS,
++  formatChange,
++  formatPrice,
++  getInstrument,
++  type Instrument,
++  type Quote,
++} from "@/lib/markets";
++import { cn } from "@/lib/utils";
++import { FlapPrice } from "./flap-price";
++
++interface RateBoardProps {
++  quotes: Record<string, Quote>;
++  feed: FeedState;
++  fx: FxStatus;
++  /** Which markets to show, in order. Defaults to all. */
++  ids?: readonly string[];
++  selectedId?: string;
++  onSelect?: (id: string) => void;
++  /** Tighter rows, no group headings or footer. */
++  compact?: boolean;
++  className?: string;
++}
++
++/** How long the first-appearance stagger runs before ticks animate immediately. */
++const INTRO_MS = 4_000;
++
++export function RateBoard({
++  quotes,
++  feed,
++  fx,
++  ids,
++  selectedId,
++  onSelect,
++  compact = false,
++  className,
++}: RateBoardProps) {
++  const [intro, setIntro] = useState(true);
++  useEffect(() => {
++    const t = setTimeout(() => setIntro(false), INTRO_MS);
++    return () => clearTimeout(t);
++  }, []);
++
++  const rows: Instrument[] = ids
++    ? ids.map((id) => getInstrument(id)).filter((i): i is Instrument => !!i)
++    : [...INSTRUMENTS];
++  const groups = [
++    { key: "fx", title: "Currencies", items: rows.filter((r) => r.cls === "fx") },
++    { key: "crypto", title: "Crypto", items: rows.filter((r) => r.cls === "crypto") },
++  ].filter((g) => g.items.length > 0);
++  const showHeadings = !compact && groups.length > 1;
++
++  let rowIndex = 0;
++  return (
++    <section
++      aria-label="Live prices"
++      className={cn(
++        "overflow-hidden rounded-xl bg-board text-chalk shadow-[0_28px_48px_-28px_rgba(16,20,26,0.6)]",
++        className,
++      )}
++    >
++      <header className="flex flex-wrap items-center justify-between gap-x-5 gap-y-1.5 px-4 pt-4 pb-3">
++        <h2 className="font-display text-xl font-semibold tracking-wide">Live prices</h2>
++        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[0.8rem] text-chalk-dim">
++          <CryptoStatus feed={feed} />
++          <FxStatusLabel fx={fx} />
++        </div>
++      </header>
++
++      {groups.map((group) => (
++        <div key={group.key}>
++          {showHeadings && (
++            <h3 className="border-t border-white/[0.07] px-4 pt-3 pb-1 text-sm text-chalk-dim">
++              {group.title}
++            </h3>
++          )}
++          <ul>
++            {group.items.map((inst) => {
++              const index = rowIndex++;
++              return (
++                <RateRow
++                  key={inst.id}
++                  inst={inst}
++                  quote={quotes[inst.id]}
++                  introDelay={intro ? index * 55 : 0}
++                  selected={selectedId === inst.id}
++                  onSelect={onSelect}
++                  compact={compact}
++                />
++              );
++            })}
++          </ul>
++        </div>
++      ))}
++
++      {!compact && (
++        <footer className="border-t border-white/[0.07] px-4 py-3 text-xs leading-relaxed text-chalk-dim">
++          Crypto prices come from Coinbase. Currency rates come from{" "}
++          {fx.source ?? "a quote provider"}. Prices are indicative and are not tradable quotes.
++        </footer>
++      )}
++    </section>
++  );
++}
++
++function RateRow({
++  inst,
++  quote,
++  introDelay,
++  selected,
++  onSelect,
++  compact,
++}: {
++  inst: Instrument;
++  quote: Quote | undefined;
++  introDelay: number;
++  selected: boolean;
++  onSelect?: (id: string) => void;
++  compact: boolean;
++}) {
++  const price = quote?.price ?? null;
++
++  // Tint the price for a moment when it moves. Comparing during render (rather
++  // than in an effect) keeps the tint in the same frame as the new digits.
++  const [lastPrice, setLastPrice] = useState(price);
++  const [tone, setTone] = useState<"idle" | "up" | "down">("idle");
++  if (price !== lastPrice) {
++    setLastPrice(price);
++    if (price !== null && lastPrice !== null) setTone(price > lastPrice ? "up" : "down");
++  }
++  useEffect(() => {
++    if (tone === "idle") return;
++    const t = setTimeout(() => setTone("idle"), 900);
++    return () => clearTimeout(t);
++  }, [tone, price]);
++
++  const change = quote?.changePct ?? null;
++  const rowClass = cn(
++    "grid w-full grid-cols-[minmax(0,1fr)_auto_4.6rem] items-center gap-3 border-t border-white/[0.07] px-4 text-left",
++    compact ? "py-2.5" : "py-3.5",
++    selected && "bg-flap shadow-[inset_3px_0_0_var(--signal)]",
++    onSelect && !selected && "hover:bg-flap/60",
++    onSelect && "focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-signal",
++  );
++
++  const body = (
++    <>
++      <span className="min-w-0">
++        <span className="block font-display text-xl font-semibold tracking-wide">{inst.label}</span>
++        {!compact && (
++          <span className="block truncate text-[0.8rem] text-chalk-dim">{inst.name}</span>
++        )}
++      </span>
++      <FlapPrice
++        text={price === null ? null : formatPrice(price, inst.decimals)}
++        tone={tone}
++        introDelay={introDelay}
++        className={compact ? "text-[1.35rem]" : "text-[1.6rem] sm:text-[1.85rem]"}
++      />
++      <span
++        className={cn(
++          "text-right font-display text-lg font-medium tabular-nums",
++          change === null || Math.abs(change) < 0.005
++            ? "text-chalk-dim"
++            : change > 0
++              ? "text-up"
++              : "text-down",
++        )}
++      >
++        {formatChange(change)}
++      </span>
++    </>
++  );
++
++  return (
++    <li>
++      {onSelect ? (
++        <button
++          type="button"
++          onClick={() => onSelect(inst.id)}
++          aria-pressed={selected}
++          aria-label={`${inst.label}, show chart`}
++          className={rowClass}
++        >
++          {body}
++        </button>
++      ) : (
++        <div className={rowClass}>{body}</div>
++      )}
++    </li>
++  );
++}
++
++function StatusDot({ tone }: { tone: "up" | "wait" | "down" }) {
++  return (
++    <span
++      aria-hidden
++      className={cn(
++        "mr-1.5 inline-block size-1.5 rounded-full align-middle",
++        tone === "up" && "bg-up",
++        tone === "wait" && "animate-pulse bg-signal",
++        tone === "down" && "bg-down",
++      )}
++    />
++  );
++}
++
++function CryptoStatus({ feed }: { feed: FeedState }) {
++  return (
++    <span>
++      <StatusDot tone={feed === "live" ? "up" : "wait"} />
++      {feed === "live"
++        ? "Crypto streaming live"
++        : feed === "connecting"
++          ? "Crypto connecting"
++          : "Crypto reconnecting"}
++    </span>
++  );
++}
++
++function FxStatusLabel({ fx }: { fx: FxStatus }) {
++  if (fx.phase === "loading") {
++    return (
++      <span>
++        <StatusDot tone="wait" />
++        Currencies loading
++      </span>
++    );
++  }
++  if (fx.phase === "error" || fx.asOf === null) {
++    return (
++      <span>
++        <StatusDot tone="down" />
++        Currencies unavailable
++      </span>
++    );
++  }
++  if (fx.mode === "live") {
++    return (
++      <span>
++        <StatusDot tone="up" />
++        Currencies updated <Age ts={fx.asOf} />
++      </span>
++    );
++  }
++  const day = new Intl.DateTimeFormat("en-GB", {
++    day: "numeric",
++    month: "short",
++    timeZone: "UTC",
++  }).format(fx.asOf);
++  return (
++    <span>
++      <StatusDot tone="wait" />
++      Currencies at the daily reference rate, {day}
++    </span>
++  );
++}
++
++function Age({ ts }: { ts: number }) {
++  const [now, setNow] = useState(() => Date.now());
++  useEffect(() => {
++    const t = setInterval(() => setNow(Date.now()), 1_000);
++    return () => clearInterval(t);
++  }, []);
++
++  const s = Math.max(0, Math.round((now - ts) / 1_000));
++  if (s < 5) return <>just now</>;
++  if (s < 60) return <>{s}s ago</>;
++  if (s < 3_600) return <>{Math.floor(s / 60)}m ago</>;
++  if (s < 86_400) return <>{Math.floor(s / 3_600)}h ago</>;
++  return <>{Math.floor(s / 86_400)}d ago</>;
++}
+diff --git a/src/hooks/use-live-markets.ts b/src/hooks/use-live-markets.ts
+new file mode 100644
+index 0000000..ed5b566
+--- /dev/null
++++ b/src/hooks/use-live-markets.ts
+@@ -0,0 +1,206 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import {
++  CRYPTO_INSTRUMENTS,
++  FX_INSTRUMENTS,
++  type FxPayload,
++  type Quote,
++} from "@/lib/markets";
++
++const COINBASE_WS = "wss://ws-feed.exchange.coinbase.com";
++/** UI updates are batched so a busy market does not re-render on every trade. */
++const FLUSH_MS = 250;
++/** No message for this long means the socket is dead even if it says it is open. */
++const STALE_MS = 20_000;
++/** The server caches, so polling often is cheap. */
++const FX_POLL_MS = 30_000;
++
++export type FeedState = "connecting" | "live" | "reconnecting";
++
++export interface FxStatus {
++  phase: "loading" | "ready" | "error";
++  mode: FxPayload["mode"] | null;
++  source: string | null;
++  /** Provider timestamp of the newest rate. */
++  asOf: number | null;
++}
++
++export interface LiveMarkets {
++  quotes: Record<string, Quote>;
++  feed: FeedState;
++  fx: FxStatus;
++}
++
++export function useLiveMarkets(): LiveMarkets {
++  const [quotes, setQuotes] = useState<Record<string, Quote>>({});
++  const [feed, setFeed] = useState<FeedState>("connecting");
++  const [fx, setFx] = useState<FxStatus>({
++    phase: "loading",
++    mode: null,
++    source: null,
++    asOf: null,
++  });
++
++  // Crypto: Coinbase public WebSocket.
++  useEffect(() => {
++    const byProduct = new Map(CRYPTO_INSTRUMENTS.map((i) => [i.product!, i]));
++    const pending = new Map<string, Quote>();
++
++    let ws: WebSocket | null = null;
++    let disposed = false;
++    let paused = false;
++    let attempt = 0;
++    let receivedTicker = false;
++    let lastMessageAt = 0;
++    let retryTimer: ReturnType<typeof setTimeout> | undefined;
++
++    const flush = () => {
++      if (pending.size === 0) return;
++      const batch = Object.fromEntries(pending);
++      pending.clear();
++      setQuotes((prev) => ({ ...prev, ...batch }));
++    };
++    const flushTimer = setInterval(flush, FLUSH_MS);
++
++    const teardownSocket = () => {
++      if (!ws) return;
++      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
++      ws.close();
++      ws = null;
++    };
++
++    const scheduleReconnect = () => {
++      teardownSocket();
++      if (disposed || paused) return;
++      const delay = Math.min(30_000, 1_000 * 2 ** attempt);
++      attempt += 1;
++      receivedTicker = false;
++      setFeed("reconnecting");
++      retryTimer = setTimeout(open, delay);
++    };
++
++    function open() {
++      if (disposed || paused) return;
++      const socket = new WebSocket(COINBASE_WS);
++      ws = socket;
++      lastMessageAt = Date.now();
++
++      socket.onopen = () => {
++        socket.send(
++          JSON.stringify({
++            type: "subscribe",
++            product_ids: [...byProduct.keys()],
++            channels: ["ticker"],
++          }),
++        );
++      };
++
++      socket.onmessage = (event) => {
++        lastMessageAt = Date.now();
++        let msg: Record<string, string>;
++        try {
++          msg = JSON.parse(event.data as string);
++        } catch {
++          return;
++        }
++        if (msg.type !== "ticker") return;
++        const inst = byProduct.get(msg.product_id);
++        const price = Number(msg.price);
++        if (!inst || !Number.isFinite(price)) return;
++
++        const open24h = Number(msg.open_24h);
++        pending.set(inst.id, {
++          price,
++          changePct: open24h > 0 ? ((price - open24h) / open24h) * 100 : null,
++          ts: Date.parse(msg.time) || Date.now(),
++        });
++        if (!receivedTicker) {
++          receivedTicker = true;
++          attempt = 0;
++          setFeed("live");
++        }
++      };
++
++      socket.onerror = () => socket.close();
++      socket.onclose = scheduleReconnect;
++    }
++
++    const watchdog = setInterval(() => {
++      if (ws && Date.now() - lastMessageAt > STALE_MS) scheduleReconnect();
++    }, 5_000);
++
++    const onVisibility = () => {
++      if (document.hidden) {
++        paused = true;
++        clearTimeout(retryTimer);
++        teardownSocket();
++      } else if (paused) {
++        paused = false;
++        attempt = 0;
++        open();
++      }
++    };
++    document.addEventListener("visibilitychange", onVisibility);
++
++    open();
++
++    return () => {
++      disposed = true;
++      clearTimeout(retryTimer);
++      clearInterval(flushTimer);
++      clearInterval(watchdog);
++      document.removeEventListener("visibilitychange", onVisibility);
++      teardownSocket();
++    };
++  }, []);
++
++  // Currencies: polled from our own /api/fx route, which caches the provider.
++  useEffect(() => {
++    let disposed = false;
++    let timer: ReturnType<typeof setTimeout> | undefined;
++
++    const run = async () => {
++      try {
++        const res = await fetch("/api/fx", { cache: "no-store" });
++        if (!res.ok) throw new Error(`fx ${res.status}`);
++        const data = (await res.json()) as FxPayload;
++        if (disposed) return;
++
++        const next: Record<string, Quote> = {};
++        for (const inst of FX_INSTRUMENTS) {
++          const r = data.rates[inst.id];
++          if (!r) continue;
++          next[inst.id] = {
++            price: r.price,
++            changePct: r.prevClose ? ((r.price - r.prevClose) / r.prevClose) * 100 : null,
++            ts: data.asOf,
++          };
++        }
++        setQuotes((prev) => ({ ...prev, ...next }));
++        setFx({ phase: "ready", mode: data.mode, source: data.source, asOf: data.asOf });
++      } catch {
++        if (!disposed) setFx((prev) => (prev.phase === "ready" ? prev : { ...prev, phase: "error" }));
++      } finally {
++        if (!disposed && !document.hidden) timer = setTimeout(run, FX_POLL_MS);
++      }
++    };
++
++    const onVisibility = () => {
++      if (!document.hidden) {
++        clearTimeout(timer);
++        void run();
++      }
++    };
++    document.addEventListener("visibilitychange", onVisibility);
++    void run();
++
++    return () => {
++      disposed = true;
++      clearTimeout(timer);
++      document.removeEventListener("visibilitychange", onVisibility);
++    };
++  }, []);
++
++  return { quotes, feed, fx };
++}
+diff --git a/src/lib/auth/dal.ts b/src/lib/auth/dal.ts
+new file mode 100644
+index 0000000..2101ddc
+--- /dev/null
++++ b/src/lib/auth/dal.ts
+@@ -0,0 +1,20 @@
++import "server-only";
++import { cache } from "react";
++import { redirect } from "next/navigation";
++import { readSession } from "./session";
++import { findUserById, toPublic, type PublicUser } from "./users";
++
++/** The signed-in user, or null. Verified against the store, once per request. */
++export const getCurrentUser = cache(async (): Promise<PublicUser | null> => {
++  const session = await readSession();
++  if (!session) return null;
++  const user = await findUserById(session.uid);
++  return user ? toPublic(user) : null;
++});
++
++/** Use at the top of any page or action that needs a signed-in user. */
++export async function requireUser(): Promise<PublicUser> {
++  const user = await getCurrentUser();
++  if (!user) redirect("/login");
++  return user;
++}
+diff --git a/src/lib/auth/form-state.ts b/src/lib/auth/form-state.ts
+new file mode 100644
+index 0000000..4b1face
+--- /dev/null
++++ b/src/lib/auth/form-state.ts
+@@ -0,0 +1,5 @@
++export interface AuthFormState {
++  errors?: Partial<Record<"name" | "email" | "password" | "form", string>>;
++  /** Echoed back so a failed submit does not wipe what the person typed. Never the password. */
++  values?: { name?: string; email?: string };
++}
+diff --git a/src/lib/auth/password.ts b/src/lib/auth/password.ts
+new file mode 100644
+index 0000000..1520701
+--- /dev/null
++++ b/src/lib/auth/password.ts
+@@ -0,0 +1,45 @@
++import "server-only";
++import { randomBytes, scrypt as scryptCallback, timingSafeEqual, type ScryptOptions } from "node:crypto";
++
++const N = 2 ** 15;
++const R = 8;
++const P = 1;
++const KEY_LENGTH = 64;
++// scrypt needs about 128 * N * R bytes, which is right at Node's 32 MiB default.
++const MAX_MEM = 64 * 1024 * 1024;
++
++function scrypt(password: string, salt: Buffer, keyLength: number, options: ScryptOptions): Promise<Buffer> {
++  return new Promise((resolve, reject) => {
++    scryptCallback(password, salt, keyLength, options, (err, key) => (err ? reject(err) : resolve(key)));
++  });
++}
++
++/** Format: scrypt$N$r$p$salt$hash. The parameters travel with the hash so they can be raised later. */
++export async function hashPassword(password: string): Promise<string> {
++  const salt = randomBytes(16);
++  const key = await scrypt(password, salt, KEY_LENGTH, { N, r: R, p: P, maxmem: MAX_MEM });
++  return ["scrypt", N, R, P, salt.toString("base64"), key.toString("base64")].join("$");
++}
++
++export async function verifyPassword(password: string, stored: string): Promise<boolean> {
++  const [alg, n, r, p, saltB64, keyB64] = stored.split("$");
++  if (alg !== "scrypt" || !saltB64 || !keyB64) return false;
++  const expected = Buffer.from(keyB64, "base64");
++  const actual = await scrypt(password, Buffer.from(saltB64, "base64"), expected.length, {
++    N: Number(n),
++    r: Number(r),
++    p: Number(p),
++    maxmem: MAX_MEM,
++  });
++  return actual.length === expected.length && timingSafeEqual(actual, expected);
++}
++
++let decoy: Promise<string> | null = null;
++/**
++ * Burn the same time a real check would. Called when the email is unknown so
++ * response time does not reveal which emails have accounts.
++ */
++export async function verifyAgainstDecoy(password: string): Promise<void> {
++  decoy ??= hashPassword(randomBytes(16).toString("hex"));
++  await verifyPassword(password, await decoy);
++}
+diff --git a/src/lib/auth/session.ts b/src/lib/auth/session.ts
+new file mode 100644
+index 0000000..f9e22e8
+--- /dev/null
++++ b/src/lib/auth/session.ts
+@@ -0,0 +1,69 @@
++import "server-only";
++import { createHmac, timingSafeEqual } from "node:crypto";
++import { cookies } from "next/headers";
++
++export const SESSION_COOKIE = "mv_session";
++const MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
++
++function secret(): string {
++  const value = process.env.SESSION_SECRET;
++  if (value && value.length >= 32) return value;
++  if (process.env.NODE_ENV === "production") {
++    throw new Error("SESSION_SECRET must be set to a random string of 32 or more characters.");
++  }
++  return "modv-development-only-secret-change-me!!";
++}
++
++function sign(payload: string): string {
++  return createHmac("sha256", secret()).update(payload).digest("base64url");
++}
++
++interface SessionPayload {
++  uid: string;
++  exp: number;
++}
++
++/** A session is `payload.signature`. The payload holds only the user id and expiry. */
++export function encodeSession(userId: string, now = Date.now()): string {
++  const payload = Buffer.from(
++    JSON.stringify({ uid: userId, exp: now + MAX_AGE_SECONDS * 1000 } satisfies SessionPayload),
++  ).toString("base64url");
++  return `${payload}.${sign(payload)}`;
++}
++
++export function decodeSession(token: string | undefined, now = Date.now()): SessionPayload | null {
++  if (!token) return null;
++  const parts = token.split(".");
++  if (parts.length !== 2) return null;
++  const [payload, signature] = parts;
++
++  const expected = Buffer.from(sign(payload));
++  const given = Buffer.from(signature);
++  if (expected.length !== given.length || !timingSafeEqual(expected, given)) return null;
++
++  try {
++    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Partial<SessionPayload>;
++    if (typeof data.uid !== "string" || typeof data.exp !== "number" || data.exp <= now) return null;
++    return { uid: data.uid, exp: data.exp };
++  } catch {
++    return null;
++  }
++}
++
++export async function createSession(userId: string): Promise<void> {
++  (await cookies()).set(SESSION_COOKIE, encodeSession(userId), {
++    httpOnly: true,
++    secure: process.env.NODE_ENV === "production",
++    sameSite: "lax",
++    path: "/",
++    maxAge: MAX_AGE_SECONDS,
++  });
++}
++
++export async function deleteSession(): Promise<void> {
++  (await cookies()).delete(SESSION_COOKIE);
++}
++
++export async function readSession(): Promise<SessionPayload | null> {
++  return decodeSession((await cookies()).get(SESSION_COOKIE)?.value);
++}
+diff --git a/src/lib/auth/throttle.ts b/src/lib/auth/throttle.ts
+new file mode 100644
+index 0000000..fea3db2
+--- /dev/null
++++ b/src/lib/auth/throttle.ts
+@@ -0,0 +1,27 @@
++import "server-only";
++
++/** In-memory brake on repeated failed sign-ins. Resets on restart; use a shared store in production. */
++const WINDOW_MS = 15 * 60_000;
++const MAX_FAILURES = 8;
++
++const failures = new Map<string, { count: number; since: number }>();
++
++export function isThrottled(key: string): boolean {
++  const entry = failures.get(key);
++  if (!entry) return false;
++  if (Date.now() - entry.since > WINDOW_MS) {
++    failures.delete(key);
++    return false;
++  }
++  return entry.count >= MAX_FAILURES;
++}
++
++export function recordFailure(key: string): void {
++  const entry = failures.get(key);
++  if (!entry || Date.now() - entry.since > WINDOW_MS) failures.set(key, { count: 1, since: Date.now() });
++  else entry.count += 1;
++}
++
++export function clearFailures(key: string): void {
++  failures.delete(key);
++}
+diff --git a/src/lib/auth/users.ts b/src/lib/auth/users.ts
+new file mode 100644
+index 0000000..6e31d45
+--- /dev/null
++++ b/src/lib/auth/users.ts
+@@ -0,0 +1,86 @@
++import "server-only";
++import { randomUUID } from "node:crypto";
++import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
++import path from "node:path";
++
++/*
++ * A deliberately small file-backed user store so the app runs with zero setup.
++ *
++ * It is fine for local development. It is NOT suitable for production: it does
++ * not survive on serverless hosts (read-only or ephemeral disk) and does not
++ * scale past one server. To move to Postgres/Supabase, reimplement the four
++ * exported functions below; nothing else in the app touches storage directly.
++ */
++
++export interface UserRecord {
++  id: string;
++  name: string;
++  email: string;
++  passwordHash: string;
++  createdAt: string;
++  /** Virtual USD in cents. No real money is held. */
++  balanceCents: number;
++}
++
++export type PublicUser = Omit<UserRecord, "passwordHash"> & { accountNo: string };
++
++export const STARTING_BALANCE_CENTS = 1_000_000;
++
++const DIR = process.env.USER_STORE_DIR ?? path.join(process.cwd(), ".data");
++const FILE = path.join(DIR, "users.json");
++
++// Serialise every read-modify-write so two signups cannot clobber each other.
++let queue: Promise<unknown> = Promise.resolve();
++function locked<T>(fn: () => Promise<T>): Promise<T> {
++  const run = queue.then(fn, fn);
++  queue = run.catch(() => undefined);
++  return run;
++}
++
++async function readAll(): Promise<UserRecord[]> {
++  try {
++    return JSON.parse(await readFile(FILE, "utf8")) as UserRecord[];
++  } catch (err) {
++    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
++    throw err;
++  }
++}
++
++async function writeAll(users: UserRecord[]): Promise<void> {
++  await mkdir(DIR, { recursive: true });
++  const tmp = `${FILE}.${process.pid}.tmp`;
++  await writeFile(tmp, JSON.stringify(users, null, 2), { mode: 0o600 });
++  await rename(tmp, FILE);
++}
++
++export function toPublic({ passwordHash: _omit, ...user }: UserRecord): PublicUser {
++  void _omit;
++  return { ...user, accountNo: `MV-${user.id.replace(/-/g, "").slice(0, 8).toUpperCase()}` };
++}
++
++export async function findUserByEmail(email: string): Promise<UserRecord | undefined> {
++  return (await readAll()).find((u) => u.email === email);
++}
++
++export async function findUserById(id: string): Promise<UserRecord | undefined> {
++  return (await readAll()).find((u) => u.id === id);
++}
++
++export async function createUser(input: {
++  name: string;
++  email: string;
++  passwordHash: string;
++}): Promise<{ ok: true; user: UserRecord } | { ok: false; reason: "email_taken" }> {
++  return locked(async () => {
++    const users = await readAll();
++    if (users.some((u) => u.email === input.email)) return { ok: false, reason: "email_taken" } as const;
++    const user: UserRecord = {
++      id: randomUUID(),
++      ...input,
++      createdAt: new Date().toISOString(),
++      balanceCents: STARTING_BALANCE_CENTS,
++    };
++    await writeAll([...users, user]);
++    return { ok: true, user } as const;
++  });
++}
+diff --git a/src/lib/fx-providers.ts b/src/lib/fx-providers.ts
+new file mode 100644
+index 0000000..dc37c92
+--- /dev/null
++++ b/src/lib/fx-providers.ts
+@@ -0,0 +1,118 @@
++import "server-only";
++import { FX_INSTRUMENTS, type FxPayload, type Instrument } from "./markets";
++
++const FRANKFURTER = "https://api.frankfurter.dev/v1";
++const TWELVE_DATA = "https://api.twelvedata.com";
++
++/** Units of a currency per 1 USD. */
++export type UsdRates = Record<string, number>;
++
++/** Every non-USD currency the board needs, derived from the instrument list. */
++const CURRENCIES = [
++  ...new Set(
++    FX_INSTRUMENTS.flatMap((i) => [i.base, i.quote]).filter(
++      (c): c is string => !!c && c !== "USD",
++    ),
++  ),
++];
++
++/** Convert USD-based rates into the price of one FX instrument. */
++export function priceFromUsdRates(inst: Instrument, rates: UsdRates): number | null {
++  if (inst.base === "USD") {
++    const r = rates[inst.quote!];
++    return r > 0 ? r : null;
++  }
++  const r = rates[inst.base!];
++  return r > 0 ? 1 / r : null;
++}
++
++const isoDate = (d: Date) => d.toISOString().slice(0, 10);
++const utcMidnight = (date: string) => Date.parse(`${date}T00:00:00Z`);
++
++/** Daily ECB reference rates, oldest first, for roughly the last `days` days. */
++export async function fetchFrankfurterSeries(
++  days: number,
++): Promise<{ date: string; rates: UsdRates }[]> {
++  const from = isoDate(new Date(Date.now() - days * 86_400_000));
++  const url = `${FRANKFURTER}/${from}..?base=USD&symbols=${CURRENCIES.join(",")}`;
++  const res = await fetch(url, {
++    headers: { accept: "application/json" },
++    cache: "no-store",
++    signal: AbortSignal.timeout(8_000),
++  });
++  if (!res.ok) throw new Error(`Frankfurter responded ${res.status}`);
++  const json = (await res.json()) as { rates?: Record<string, UsdRates> };
++  const rows = Object.entries(json.rates ?? {})
++    .sort(([a], [b]) => (a < b ? -1 : 1))
++    .map(([date, rates]) => ({ date, rates }));
++  if (rows.length === 0) throw new Error("Frankfurter returned no rates");
++  return rows;
++}
++
++/** Keyless fallback. Rates are published once per working day. */
++export async function fetchFrankfurterRates(): Promise<FxPayload> {
++  const series = await fetchFrankfurterSeries(7);
++  const latest = series[series.length - 1];
++  const previous = series.length > 1 ? series[series.length - 2] : null;
++
++  const rates: FxPayload["rates"] = {};
++  for (const inst of FX_INSTRUMENTS) {
++    const price = priceFromUsdRates(inst, latest.rates);
++    if (price === null) continue;
++    rates[inst.id] = {
++      price,
++      prevClose: previous ? priceFromUsdRates(inst, previous.rates) : null,
++    };
++  }
++  return {
++    mode: "reference",
++    source: "the European Central Bank (daily reference rates)",
++    asOf: utcMidnight(latest.date),
++    rates,
++  };
++}
++
++interface TwelveDataQuote {
++  status?: string;
++  close?: string;
++  previous_close?: string;
++  timestamp?: number;
++}
++
++/** Real-time quotes. Needs TWELVE_DATA_API_KEY. One credit per symbol per call. */
++export async function fetchTwelveDataRates(apiKey: string): Promise<FxPayload> {
++  const symbols = FX_INSTRUMENTS.map((i) => i.label).join(",");
++  const url = `${TWELVE_DATA}/quote?symbol=${symbols}&apikey=${encodeURIComponent(apiKey)}`;
++  const res = await fetch(url, {
++    headers: { accept: "application/json" },
++    cache: "no-store",
++    signal: AbortSignal.timeout(8_000),
++  });
++  if (!res.ok) throw new Error(`Twelve Data responded ${res.status}`);
++
++  const json = (await res.json()) as Record<string, unknown>;
++  // Errors such as an exhausted daily quota arrive as HTTP 200 with a status field.
++  if (json.status === "error") {
++    throw new Error(`Twelve Data: ${String(json.message ?? json.code ?? "error")}`);
++  }
++
++  const rates: FxPayload["rates"] = {};
++  let newest = 0;
++  for (const inst of FX_INSTRUMENTS) {
++    const q = json[inst.label] as TwelveDataQuote | undefined;
++    if (!q || q.status === "error") continue;
++    const price = Number(q.close);
++    if (!Number.isFinite(price) || price <= 0) continue;
++    const prev = Number(q.previous_close);
++    rates[inst.id] = { price, prevClose: prev > 0 ? prev : null };
++    if (typeof q.timestamp === "number") newest = Math.max(newest, q.timestamp * 1000);
++  }
++  if (Object.keys(rates).length === 0) throw new Error("Twelve Data returned no usable quotes");
++
++  return {
++    mode: "live",
++    source: "Twelve Data",
++    asOf: newest || Date.now(),
++    rates,
++  };
++}
+diff --git a/src/lib/fx.ts b/src/lib/fx.ts
+new file mode 100644
+index 0000000..ca9e063
+--- /dev/null
++++ b/src/lib/fx.ts
+@@ -0,0 +1,60 @@
++import "server-only";
++import { fetchFrankfurterRates, fetchTwelveDataRates } from "./fx-providers";
++import type { FxPayload } from "./markets";
++
++/*
++ * Twelve Data's free plan allows 800 credits a day and each of the 6 pairs costs
++ * one credit per call, so we cache hard. Every browser polls /api/fx, but the
++ * provider is only called when the cache is older than the TTL below.
++ * Set FX_CACHE_SECONDS to tune it (minimum 5).
++ */
++const LIVE_TTL_MS = 90_000;
++const REFERENCE_TTL_MS = 15 * 60_000;
++/** After a Twelve Data failure, wait this long before trying it again. */
++const LIVE_RETRY_MS = 5 * 60_000;
++
++let cache: { at: number; data: FxPayload } | null = null;
++let inflight: Promise<FxPayload> | null = null;
++let liveBlockedUntil = 0;
++
++function liveTtl(): number {
++  const seconds = Number(process.env.FX_CACHE_SECONDS);
++  return Number.isFinite(seconds) && seconds >= 5 ? seconds * 1000 : LIVE_TTL_MS;
++}
++
++function ttlFor(data: FxPayload, hasKey: boolean): number {
++  if (data.mode === "live") return liveTtl();
++  // With a key configured but currently falling back, recheck the live provider sooner.
++  return hasKey ? Math.min(REFERENCE_TTL_MS, LIVE_RETRY_MS) : REFERENCE_TTL_MS;
++}
++
++async function load(apiKey: string | undefined): Promise<FxPayload> {
++  try {
++    let data: FxPayload | null = null;
++    if (apiKey && Date.now() >= liveBlockedUntil) {
++      try {
++        data = await fetchTwelveDataRates(apiKey);
++      } catch (err) {
++        liveBlockedUntil = Date.now() + LIVE_RETRY_MS;
++        console.warn("[fx] live provider failed, using ECB reference rates:", err);
++      }
++    }
++    data ??= await fetchFrankfurterRates();
++    cache = { at: Date.now(), data };
++    return data;
++  } catch (err) {
++    if (cache) return { ...cache.data, stale: true };
++    throw err;
++  }
++}
++
++export async function getFxRates(): Promise<FxPayload> {
++  const apiKey = process.env.TWELVE_DATA_API_KEY || undefined;
++  if (cache && Date.now() - cache.at < ttlFor(cache.data, !!apiKey)) return cache.data;
++  if (!inflight) {
++    inflight = load(apiKey).finally(() => {
++      inflight = null;
++    });
++  }
++  return inflight;
++}
+diff --git a/src/lib/history.ts b/src/lib/history.ts
+new file mode 100644
+index 0000000..0873a1c
+--- /dev/null
++++ b/src/lib/history.ts
+@@ -0,0 +1,57 @@
++import "server-only";
++import { fetchFrankfurterSeries, priceFromUsdRates } from "./fx-providers";
++import { getInstrument, type HistoryPayload, type Instrument } from "./markets";
++
++const CRYPTO_TTL_MS = 60_000;
++const FX_TTL_MS = 60 * 60_000;
++
++const cache = new Map<string, { at: number; data: HistoryPayload }>();
++
++/** Last 300 five-minute candles (about 25 hours). Public endpoint, no key. */
++async function cryptoHistory(inst: Instrument): Promise<HistoryPayload> {
++  const url = `https://api.exchange.coinbase.com/products/${inst.product}/candles?granularity=300`;
++  const res = await fetch(url, {
++    // Coinbase rejects requests that carry no User-Agent.
++    headers: { accept: "application/json", "user-agent": "modv/0.1" },
++    cache: "no-store",
++    signal: AbortSignal.timeout(8_000),
++  });
++  if (!res.ok) throw new Error(`Coinbase candles responded ${res.status}`);
++  // Rows are [time (s), low, high, open, close, volume], newest first.
++  const rows = (await res.json()) as number[][];
++  const points = rows
++    .map((r) => [r[0] * 1000, r[4]] as [number, number])
++    .filter(([t, v]) => Number.isFinite(t) && Number.isFinite(v))
++    .sort((a, b) => a[0] - b[0]);
++  return { id: inst.id, interval: "5m", points };
++}
++
++/** Roughly six weeks of ECB daily reference rates. */
++async function fxHistory(inst: Instrument): Promise<HistoryPayload> {
++  const series = await fetchFrankfurterSeries(45);
++  const points: [number, number][] = [];
++  for (const { date, rates } of series) {
++    const price = priceFromUsdRates(inst, rates);
++    if (price !== null) points.push([Date.parse(`${date}T00:00:00Z`), price]);
++  }
++  return { id: inst.id, interval: "1d", points };
++}
++
++/** Returns null for an unknown market id. Throws when the upstream provider fails. */
++export async function getHistory(id: string): Promise<HistoryPayload | null> {
++  const inst = getInstrument(id);
++  if (!inst) return null;
++
++  const hit = cache.get(id);
++  const ttl = inst.cls === "crypto" ? CRYPTO_TTL_MS : FX_TTL_MS;
++  if (hit && Date.now() - hit.at < ttl) return hit.data;
++
++  try {
++    const data = inst.cls === "crypto" ? await cryptoHistory(inst) : await fxHistory(inst);
++    cache.set(id, { at: Date.now(), data });
++    return data;
++  } catch (err) {
++    if (hit) return hit.data; // serve stale rather than an empty chart
++    throw err;
++  }
++}
+diff --git a/src/lib/markets.ts b/src/lib/markets.ts
+new file mode 100644
+index 0000000..3cbdf07
+--- /dev/null
++++ b/src/lib/markets.ts
+@@ -0,0 +1,92 @@
++export type AssetClass = "fx" | "crypto";
++
++export interface Instrument {
++  /** Stable id used in URLs, state keys and API payloads, e.g. "EURUSD". */
++  id: string;
++  /** Display symbol, e.g. "EUR/USD". */
++  label: string;
++  name: string;
++  cls: AssetClass;
++  /** Decimal places shown on the board. */
++  decimals: number;
++  /** Coinbase product id. Crypto only. */
++  product?: string;
++  /** ISO currency codes. FX only. */
++  base?: string;
++  quote?: string;
++}
++
++export const INSTRUMENTS: readonly Instrument[] = [
++  { id: "EURUSD", label: "EUR/USD", name: "Euro / US dollar", cls: "fx", decimals: 5, base: "EUR", quote: "USD" },
++  { id: "GBPUSD", label: "GBP/USD", name: "British pound / US dollar", cls: "fx", decimals: 5, base: "GBP", quote: "USD" },
++  { id: "USDJPY", label: "USD/JPY", name: "US dollar / Japanese yen", cls: "fx", decimals: 3, base: "USD", quote: "JPY" },
++  { id: "USDCHF", label: "USD/CHF", name: "US dollar / Swiss franc", cls: "fx", decimals: 5, base: "USD", quote: "CHF" },
++  { id: "AUDUSD", label: "AUD/USD", name: "Australian dollar / US dollar", cls: "fx", decimals: 5, base: "AUD", quote: "USD" },
++  { id: "USDCAD", label: "USD/CAD", name: "US dollar / Canadian dollar", cls: "fx", decimals: 5, base: "USD", quote: "CAD" },
++  { id: "BTCUSD", label: "BTC/USD", name: "Bitcoin", cls: "crypto", decimals: 2, product: "BTC-USD" },
++  { id: "ETHUSD", label: "ETH/USD", name: "Ethereum", cls: "crypto", decimals: 2, product: "ETH-USD" },
++  { id: "SOLUSD", label: "SOL/USD", name: "Solana", cls: "crypto", decimals: 2, product: "SOL-USD" },
++  { id: "XRPUSD", label: "XRP/USD", name: "XRP", cls: "crypto", decimals: 4, product: "XRP-USD" },
++];
++
++export const FX_INSTRUMENTS = INSTRUMENTS.filter((i) => i.cls === "fx");
++export const CRYPTO_INSTRUMENTS = INSTRUMENTS.filter((i) => i.cls === "crypto");
++
++const BY_ID = new Map(INSTRUMENTS.map((i) => [i.id, i]));
++export function getInstrument(id: string): Instrument | undefined {
++  return BY_ID.get(id);
++}
++
++/** A latest price for one instrument. */
++export interface Quote {
++  price: number;
++  /** Percent change against the reference close/open. Null when unknown. */
++  changePct: number | null;
++  /** When the price was struck, ms since epoch. */
++  ts: number;
++}
++
++/** Response of GET /api/fx. */
++export interface FxPayload {
++  /** "live" = real-time quote provider, "reference" = ECB daily reference rates. */
++  mode: "live" | "reference";
++  source: string;
++  /** Provider timestamp of the newest rate, ms since epoch. */
++  asOf: number;
++  /** True when the provider failed and an older cached answer was served. */
++  stale?: boolean;
++  rates: Record<string, { price: number; prevClose: number | null }>;
++}
++
++/** Response of GET /api/history. Points are [ms since epoch, price]. */
++export interface HistoryPayload {
++  id: string;
++  interval: "5m" | "1d";
++  points: [number, number][];
++}
++
++const formatters = new Map<number, Intl.NumberFormat>();
++export function formatPrice(value: number, decimals: number): string {
++  let f = formatters.get(decimals);
++  if (!f) {
++    f = new Intl.NumberFormat("en-US", {
++      minimumFractionDigits: decimals,
++      maximumFractionDigits: decimals,
++    });
++    formatters.set(decimals, f);
++  }
++  return f.format(value);
++}
++
++export function formatChange(pct: number | null): string {
++  if (pct === null || !Number.isFinite(pct)) return "n/a";
++  const rounded = Math.abs(pct) < 0.005 ? 0 : pct;
++  return `${rounded > 0 ? "+" : rounded < 0 ? "-" : ""}${Math.abs(rounded).toFixed(2)}%`;
++}
++
++export function formatUsd(cents: number): string {
++  return new Intl.NumberFormat("en-US", {
++    style: "currency",
++    currency: "USD",
++  }).format(cents / 100);
++}
