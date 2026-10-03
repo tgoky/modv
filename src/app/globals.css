@@ -11,24 +11,18 @@
   --font-mono: var(--font-geist-mono);
   --font-heading: var(--font-sans);
   --font-display: var(--font-display);
-  --color-signal: var(--signal);
-  --color-board: var(--board);
-  --color-flap: var(--flap);
-  --color-flap-edge: var(--flap-edge);
-  --color-chalk: var(--chalk);
-  --color-chalk-dim: var(--chalk-dim);
-  --color-up: var(--up);
-  --color-down: var(--down);
-  --color-up-ink: var(--up-ink);
-  --color-down-ink: var(--down-ink);
-  --color-sidebar-ring: var(--sidebar-ring);
-  --color-sidebar-border: var(--sidebar-border);
-  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-  --color-sidebar-accent: var(--sidebar-accent);
-  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-  --color-sidebar-primary: var(--sidebar-primary);
-  --color-sidebar-foreground: var(--sidebar-foreground);
-  --color-sidebar: var(--sidebar);
+  --color-ink: var(--ink);
+  --color-paper: var(--paper);
+  --color-paper-2: var(--paper-2);
+  --color-night: var(--night);
+  --color-night-2: var(--night-2);
+  --color-night-3: var(--night-3);
+  --color-gold: var(--gold);
+  --color-stamp: var(--stamp);
+  --color-gain: var(--gain);
+  --color-loss: var(--loss);
+  --color-gain-ink: var(--gain-ink);
+  --color-loss-ink: var(--loss-ink);
   --color-chart-5: var(--chart-5);
   --color-chart-4: var(--chart-4);
   --color-chart-3: var(--chart-3);
@@ -60,25 +54,25 @@
 }
 
 :root {
-  /* Counter: a cool paper page with ink type. */
-  --background: #e9ecef;
-  --foreground: #10141a;
-  --card: #f6f7f8;
-  --card-foreground: #10141a;
-  --popover: #f6f7f8;
-  --popover-foreground: #10141a;
-  --primary: #10141a;
-  --primary-foreground: #f6f7f8;
-  --secondary: #dde1e5;
-  --secondary-foreground: #10141a;
-  --muted: #dde1e5;
-  --muted-foreground: #58626e;
-  --accent: #dde1e5;
-  --accent-foreground: #10141a;
+  /* Paper: banknote stock and deep-green ink. */
+  --background: #ebf0e3;
+  --foreground: #0a1a13;
+  --card: #f5f8ef;
+  --card-foreground: #0a1a13;
+  --popover: #f5f8ef;
+  --popover-foreground: #0a1a13;
+  --primary: #0d3b2e;
+  --primary-foreground: #f5f8ef;
+  --secondary: #dfe7d4;
+  --secondary-foreground: #0a1a13;
+  --muted: #dfe7d4;
+  --muted-foreground: #4f6157;
+  --accent: #dfe7d4;
+  --accent-foreground: #0a1a13;
   --destructive: #b8321f;
-  --border: #cbd1d8;
-  --input: #b4bcc5;
-  --ring: #10141a;
+  --border: #c8d3bb;
+  --input: #b3c1a5;
+  --ring: #0d3b2e;
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
@@ -94,17 +88,19 @@
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
 
-  /* Board: the split-flap display that carries the live prices. */
-  --signal: #ffd11a;
-  --board: #12151a;
-  --flap: #1d2128;
-  --flap-edge: #0a0c0f;
-  --chalk: #efebdd;
-  --chalk-dim: #8f9aa6;
-  --up: #35d69a;
-  --down: #ff7566;
-  --up-ink: #0a7a52;
-  --down-ink: #b8321f;
+  --ink: #0d3b2e;
+  --paper: #ebf0e3;
+  --paper-2: #dfe7d4;
+  /* Night: the trading terminal. */
+  --night: #08120e;
+  --night-2: #0e1b15;
+  --night-3: #16281f;
+  --gold: #c9a23f;
+  --stamp: #d8412b;
+  --gain: #22c777;
+  --loss: #f0533e;
+  --gain-ink: #0b7a48;
+  --loss-ink: #b8321f;
 }
 
 .dark {
@@ -163,27 +159,34 @@
   }
 }
 
-/* A character drops into place from the top edge, like a split-flap tile. */
-@keyframes flap-drop {
-  from {
-    transform: rotateX(-88deg);
-    opacity: 0.15;
-  }
-  to {
-    transform: rotateX(0deg);
-    opacity: 1;
-  }
+/* Rolling ticker: the track holds two copies of the items, so moving by half its width loops seamlessly. */
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.marquee-track {
+  display: flex;
+  width: max-content;
+  animation: marquee var(--marquee-duration, 60s) linear infinite;
+}
+.marquee:hover .marquee-track,
+.marquee:focus-within .marquee-track {
+  animation-play-state: paused;
 }
 
-.flap-char {
-  display: inline-block;
-  transform-origin: 50% 0%;
-  backface-visibility: hidden;
-  animation: flap-drop 280ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+@keyframes stamp-in {
+  0% { transform: rotate(-14deg) scale(1.9); opacity: 0; }
+  60% { transform: rotate(-9deg) scale(0.94); opacity: 1; }
+  100% { transform: rotate(-9deg) scale(1); opacity: 1; }
 }
+.stamp-in { animation: stamp-in 480ms cubic-bezier(0.2, 0.9, 0.3, 1) both; }
+
+@keyframes tick-up { from { background-color: color-mix(in oklab, var(--gain) 35%, transparent); } to { background-color: transparent; } }
+@keyframes tick-down { from { background-color: color-mix(in oklab, var(--loss) 35%, transparent); } to { background-color: transparent; } }
+.tick-up { animation: tick-up 700ms ease-out; }
+.tick-down { animation: tick-down 700ms ease-out; }
 
 @media (prefers-reduced-motion: reduce) {
-  .flap-char {
-    animation: none;
-  }
+  .marquee-track { animation: none; }
+  .stamp-in, .tick-up, .tick-down { animation: none; }
 }

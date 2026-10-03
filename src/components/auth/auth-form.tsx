@@ -6,12 +6,13 @@ import { login, signup } from "@/app/actions/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { BRAND } from "@/lib/brand";
 import { cn } from "@/lib/utils";
 
 const COPY = {
   signup: {
-    submit: "Open account",
-    pending: "Opening account",
+    submit: "Create account",
+    pending: "Creating account",
     switchText: "Already have an account?",
     switchLink: "Log in",
     switchHref: "/login",
@@ -19,8 +20,8 @@ const COPY = {
   login: {
     submit: "Log in",
     pending: "Logging in",
-    switchText: "New to modv?",
-    switchLink: "Open an account",
+    switchText: `New to ${BRAND.name}?`,
+    switchLink: "Sign up",
     switchHref: "/signup",
   },
 } as const;
@@ -92,7 +93,7 @@ export function AuthForm({ mode }: { mode: "login" | "signup" }) {
       <Button
         type="submit"
         disabled={pending}
-        className="h-11 w-full bg-signal text-base font-semibold text-foreground hover:bg-signal/85"
+        className="h-11 w-full bg-gold text-base font-semibold text-night hover:bg-gold/85"
       >
         {pending ? `${copy.pending}...` : copy.submit}
       </Button>

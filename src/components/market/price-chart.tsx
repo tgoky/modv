@@ -1,15 +1,15 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { formatPrice } from "@/lib/markets";
 
 type Point = [number, number];
 
 interface PriceChartProps {
   /** Historical points, oldest first. */
   points: Point[];
-  interval: "5m" | "1d";
-  decimals: number;
+  /** Axis label style: clock times for intraday charts, dates for daily ones. */
+  timeStyle: "time" | "date";
+  format: (value: number) => string;
   label: string;
   /** Latest live price and when it was struck. Appended to the history as it changes. */
   livePrice: number | null;
@@ -29,7 +29,7 @@ function appendTail(tail: Point[], point: Point): Point[] {
   return next.length > TAIL_MAX ? next.slice(next.length - TAIL_MAX) : next;
 }
 
-export function PriceChart({ points, interval, decimals, label, livePrice, liveTs }: PriceChartProps) {
+export function PriceChart({ points, timeStyle, format, label, livePrice, liveTs }: PriceChartProps) {
   const [tail, setTail] = useState<Point[]>([]);
   const [seenTs, setSeenTs] = useState<number | null>(null);
   if (livePrice !== null && liveTs !== null && liveTs !== seenTs) {
@@ -88,25 +88,25 @@ export function PriceChart({ points, interval, decimals, label, livePrice, liveT
     () =>
       new Intl.DateTimeFormat(
         undefined,
-        interval === "5m"
+        timeStyle === "time"
           ? { hour: "2-digit", minute: "2-digit" }
           : { day: "numeric", month: "short" },
       ),
-    [interval],
+    [timeStyle],
   );
   const fullFmt = useMemo(
     () =>
       new Intl.DateTimeFormat(
         undefined,
-        interval === "5m"
+        timeStyle === "time"
           ? { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }
           : { day: "numeric", month: "short", year: "numeric" },
       ),
-    [interval],
+    [timeStyle],
   );
 
   const rising = series.length > 1 && series[series.length - 1][1] >= series[0][1];
-  const stroke = rising ? "var(--up-ink)" : "var(--down-ink)";
+  const stroke = rising ? "var(--gain)" : "var(--loss)";
 
   const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
     if (!geometry) return;
@@ -141,22 +141,22 @@ export function PriceChart({ points, interval, decimals, label, livePrice, liveT
         >
           {geometry.grid.map((g) => (
             <g key={g.y}>
-              <line x1={0} x2={geometry.plotW} y1={g.y} y2={g.y} stroke="var(--border)" strokeWidth={1} />
-              <text x={geometry.plotW + 10} y={g.y + 4} fontSize={12} fill="var(--muted-foreground)" className="tabular-nums">
-                {formatPrice(g.v, decimals)}
+              <line x1={0} x2={geometry.plotW} y1={g.y} y2={g.y} stroke="rgba(235,240,227,0.08)" strokeWidth={1} />
+              <text x={geometry.plotW + 10} y={g.y + 4} fontSize={12} fill="rgba(235,240,227,0.55)" className="font-mono tabular-nums">
+                {format(g.v)}
               </text>
             </g>
           ))}
           <path d={geometry.area} fill={stroke} opacity={0.07} />
           <path d={geometry.line} fill="none" stroke={stroke} strokeWidth={1.75} strokeLinejoin="round" />
 
-          <text x={0} y={HEIGHT - 8} fontSize={12} fill="var(--muted-foreground)">
+          <text x={0} y={HEIGHT - 8} fontSize={12} fill="rgba(235,240,227,0.55)">
             {timeFmt.format(geometry.t0)}
           </text>
-          <text x={geometry.plotW / 2} y={HEIGHT - 8} fontSize={12} textAnchor="middle" fill="var(--muted-foreground)">
+          <text x={geometry.plotW / 2} y={HEIGHT - 8} fontSize={12} textAnchor="middle" fill="rgba(235,240,227,0.55)">
             {timeFmt.format((geometry.t0 + geometry.t1) / 2)}
           </text>
-          <text x={geometry.plotW} y={HEIGHT - 8} fontSize={12} textAnchor="end" fill="var(--muted-foreground)">
+          <text x={geometry.plotW} y={HEIGHT - 8} fontSize={12} textAnchor="end" fill="rgba(235,240,227,0.55)">
             {timeFmt.format(geometry.t1)}
           </text>
 
@@ -165,8 +165,8 @@ export function PriceChart({ points, interval, decimals, label, livePrice, liveT
             cx={geometry.xs[geometry.xs.length - 1]}
             cy={geometry.y(series[series.length - 1][1])}
             r={4.5}
-            fill="var(--signal)"
-            stroke="var(--foreground)"
+            fill="var(--gold)"
+            stroke="var(--night)"
             strokeWidth={1.5}
           />
 
@@ -177,11 +177,11 @@ export function PriceChart({ points, interval, decimals, label, livePrice, liveT
                 x2={geometry.xs[hover]}
                 y1={PAD.top}
                 y2={geometry.base}
-                stroke="var(--foreground)"
+                stroke="rgba(235,240,227,0.7)"
                 strokeWidth={1}
                 strokeDasharray="3 3"
               />
-              <circle cx={geometry.xs[hover]} cy={geometry.y(hovered[1])} r={4} fill="var(--foreground)" />
+              <circle cx={geometry.xs[hover]} cy={geometry.y(hovered[1])} r={4} fill="var(--paper)" />
             </g>
           )}
         </svg>
@@ -189,11 +189,11 @@ export function PriceChart({ points, interval, decimals, label, livePrice, liveT
 
       {hovered && hover !== null && geometry && (
         <div
-          className="pointer-events-none absolute top-1 rounded-md bg-foreground px-2.5 py-1.5 text-background shadow-md"
+          className="pointer-events-none absolute top-1 rounded-md bg-paper px-2.5 py-1.5 text-night shadow-md"
           style={{ left: Math.min(Math.max(geometry.xs[hover] + 10, 0), Math.max(geometry.plotW - 130, 0)) }}
         >
           <div className="font-display text-lg leading-none font-medium tabular-nums">
-            {formatPrice(hovered[1], decimals)}
+            {format(hovered[1])}
           </div>
           <div className="mt-1 text-xs leading-none opacity-70">{fullFmt.format(hovered[0])}</div>
         </div>

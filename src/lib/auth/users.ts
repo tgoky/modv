@@ -18,13 +18,9 @@ export interface UserRecord {
   email: string;
   passwordHash: string;
   createdAt: string;
-  /** Virtual USD in cents. No real money is held. */
-  balanceCents: number;
 }
 
 export type PublicUser = Omit<UserRecord, "passwordHash"> & { accountNo: string };
-
-export const STARTING_BALANCE_CENTS = 1_000_000;
 
 const DIR = process.env.USER_STORE_DIR ?? path.join(process.cwd(), ".data");
 const FILE = path.join(DIR, "users.json");
@@ -78,7 +74,6 @@ export async function createUser(input: {
       id: randomUUID(),
       ...input,
       createdAt: new Date().toISOString(),
-      balanceCents: STARTING_BALANCE_CENTS,
     };
     await writeAll([...users, user]);
     return { ok: true, user } as const;

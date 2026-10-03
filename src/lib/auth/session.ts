@@ -11,7 +11,7 @@ function secret(): string {
   if (process.env.NODE_ENV === "production") {
     throw new Error("SESSION_SECRET must be set to a random string of 32 or more characters.");
   }
-  return "modv-development-only-secret-change-me!!";
+  return "prerich-development-only-secret-change-me!!";
 }
 
 function sign(payload: string): string {

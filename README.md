@@ -1,59 +1,30 @@
-# modv
+# Prerich
 
-A test-experiment forex and crypto broker app: a landing page with live prices, account signup and login, and a dashboard.
+A prop firm for crypto traders. Pay $1, get a $100 challenge account, trade real futures and meme coin prices, hit the target without breaking the loss limit.
+
+The capital is simulated. The prices, fees and slippage are real. In this build the $1 entry payment is simulated too.
 
 ## Setup
 
 ```bash
 pnpm install
-cp .env.example .env.local   # then fill in SESSION_SECRET (openssl rand -base64 32)
+cp .env.example .env.local   # set SESSION_SECRET (openssl rand -base64 32)
 pnpm dev
 ```
 
-## Where the prices come from
+## How it works
 
-- **Crypto** streams into the browser from Coinbase's public WebSocket (no key). The dashboard chart loads 5-minute candles through `/api/history` and extends them live.
-- **Currencies** are polled from `/api/fx`, which caches the provider server-side. With `TWELVE_DATA_API_KEY` set it uses Twelve Data real-time quotes (free plan: 800 requests a day, so responses are cached for 90 seconds). Without a key, or if the provider errors, it falls back to the ECB's daily reference rates via Frankfurter, and the board labels them as daily rates.
+- **Rules** live in `src/lib/brand.ts`. The landing page, the terminal and the engine all read the same object.
+- **Engine** (`src/lib/sim/engine.ts`) is pure functions: fills, fees, slippage, simulated gas, liquidation, equity, and the pass/fail rules. No network access, so it is easy to test.
+- **Prices are always fetched by the server at trade time** (`src/lib/sim/prices.ts`), never trusted from the browser.
+  - Futures: Hyperliquid public API (`allMids`, `metaAndAssetCtxs`, `candleSnapshot`), and the browser streams `allMids` and `l2Book` over WebSocket for live prices and the order book.
+  - Meme coins: DexScreener (discovery and prices, cached about 30 seconds upstream) and GeckoTerminal (chart candles).
+- **Simulated gas and slippage.** Every meme coin swap costs a per-chain gas amount from the virtual balance (`src/lib/sim/chains.ts`) plus a swap fee, and moves the price by your share of the pool's liquidity.
+- **Accounts and challenges** are stored in JSON files under `.data/` for development. Replace `src/lib/auth/users.ts` and `src/lib/sim/store.ts` with your database before deploying.
 
-## Accounts
+## Before real users
 
-Passwords are hashed with scrypt and sessions are HMAC-signed cookies; there are no extra dependencies. Users are stored in a local JSON file (`.data/users.json`) so the app runs with zero setup. That is for development only: replace the functions in `src/lib/auth/users.ts` with your database before deploying. Balances are virtual.
-
----
-
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
-
-## Getting Started
-
-First, run the development server:
-
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Verify real payments (on-chain transfer or a payment provider webhook) before `startChallenge` creates an account.
+- Rules are enforced lazily, when an account is next loaded or traded. Add a background worker (for example Inngest) that checks open accounts against live prices, otherwise a position could cross its liquidation price and recover unseen while the trader is away.
+- Replace the in-memory sign-in throttle with a shared store.
+- A prop firm that charges fees and promises payouts can be regulated as a financial or gambling product depending on where you operate. Get legal advice before launch.
